@@ -12,6 +12,11 @@ import re                                # 正則表達式
 from PIL import Image, ImageDraw, ImageFont  # 圖片繪製與字型
 import pandas as pd                      # Excel 讀取
 
+# ✅ 引入 VLM 判斷函式
+from vlm import detect_multi_invoice
+# ✅ 引入 LLM 擷取函式
+from llm import extract_invoice_fields_by_llm
+
 # =========================
 # 建立資料夾
 # =========================
@@ -36,8 +41,8 @@ cc = OpenCC('s2t')  # s2t = Simplified to Traditional
 # =========================
 # 目標 PDF 設定
 # =========================
-pdf_path = "file/split_output/scan-00003/page_1.pdf"  # 要處理的 PDF 路徑
-pdf_name = "page_1"                                    # 輸出檔名前綴
+pdf_path = "file/split_output/scan-00003/page_6.pdf"  # 要處理的 PDF 路徑
+pdf_name = "page_6"                                    # 輸出檔名前綴
 
 # =========================
 # PDF → 圖片
@@ -50,35 +55,66 @@ pages = convert_from_path(
 
 
 
-# # =========================
-# # 目標檔案設定
-# # =========================
-# input_path = "file/invoices/page1_invoice3.png"  # 可以是 PDF 或圖片
-# input_name = os.path.splitext(os.path.basename(input_path))[0]  # 自動取檔名
+# =========================
+# 目標檔案設定
+# =========================
+input_path = "file/invoices/page1_invoice3.png"  # 可以是 PDF 或圖片
+input_name = os.path.splitext(os.path.basename(input_path))[0]  # 自動取檔名
 
-# # =========================
-# # PDF → 圖片 / 直接讀圖片
-# # =========================
-# IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+# =========================
+# PDF → 圖片 / 直接讀圖片
+# =========================
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
-# ext = os.path.splitext(input_path)[1].lower()
+ext = os.path.splitext(input_path)[1].lower()
 
-# if ext == ".pdf":
-#     pages = convert_from_path(
-#         input_path,
-#         dpi=700,
-#         poppler_path="Release-25.12.0-0/poppler-25.12.0/Library/bin"
-#     )
-#     print(f"PDF 模式：共 {len(pages)} 頁")
+if ext == ".pdf":
+    pages = convert_from_path(
+        input_path,
+        dpi=700,
+        poppler_path="Release-25.12.0-0/poppler-25.12.0/Library/bin"
+    )
+    print(f"PDF 模式：共 {len(pages)} 頁")
 
-# elif ext in IMAGE_EXTENSIONS:
-#     img_pil = Image.open(input_path).convert("RGB")
-#     pages = [img_pil]  # 包成 list，讓後續迴圈邏輯不變
-#     print(f"圖片模式：{input_path}")
+elif ext in IMAGE_EXTENSIONS:
+    img_pil = Image.open(input_path).convert("RGB")
+    pages = [img_pil]  # 包成 list，讓後續迴圈邏輯不變
+    print(f"圖片模式：{input_path}")
 
-# else:
-#     raise ValueError(f"不支援的檔案格式：{ext}")
+else:
+    raise ValueError(f"不支援的檔案格式：{ext}")
 
+
+def is_chinese_amount_match(ocr_amount: str, std_amount: str) -> tuple[bool, str]:
+    """
+    比對中文大寫金額，處理前綴零和「元整」的差異
+    """
+    if not ocr_amount or not std_amount:
+        return False, "資料缺失"
+
+    ocr = re.sub(r"\s+", "", ocr_amount)
+    std = re.sub(r"\s+", "", std_amount)
+
+    # 1. 完全相等
+    if ocr == std:
+        return True, "完全相符"
+
+    # 2. OCR結果包含於標準答案中（標準答案有前綴零或元整）
+    if len(ocr) >= 2 and ocr in std:
+        return True, "核心金額相符（標準答案含前綴零或元整）"
+
+    # 3. 去除「元整」後比對
+    ocr_clean = re.sub(r'元整$', '', ocr)
+    std_clean  = re.sub(r'元整$', '', std)
+    if ocr_clean and ocr_clean in std_clean:
+        return True, "去除元整後核心金額相符"
+
+    # 4. 去除前綴零（零仟零佰零拾零萬）後比對
+    std_no_zero = re.sub(r'^[零仟佰拾萬]+', '', std_clean)
+    if ocr_clean and ocr_clean == std_no_zero:
+        return True, "去除前綴零後完全相符"
+
+    return False, "不相符"
 
 # =========================
 # 讀取 Excel 標準答案
@@ -120,7 +156,7 @@ BUYER_COMPANY_NAME_FIXED = "燿華電子股份有限公司"
 # =========================
 # 與 Excel 標準答案比對
 # =========================
-def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, seller_company_name, amount_validation, extracted_invoice_no, standard):
+def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, seller_company_name, amount_validation, extracted_invoice_no, standard, llm_fields=None):
     """
     將 OCR 擷取結果與 Excel 標準答案逐欄比對
     
@@ -212,6 +248,55 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
     #     "OCR結果":  ocr_total,
     #     "是否一致": ocr_total == std_total
     # }
+
+    # --- ✅ LLM 欄位比對 ---
+    if llm_fields:
+        # 年度期間
+        std_period = standard.get("年度期間", "").strip()
+        ocr_period = (llm_fields.get("年度期間") or "").strip()
+        compare["年度期間"] = {
+            "標準答案": std_period,
+            "OCR結果":  ocr_period,
+            "是否一致": ocr_period == std_period
+        }
+
+        # 金額大寫中文
+        std_chinese = standard.get("金額大寫中文", "").strip()
+        ocr_chinese = (llm_fields.get("金額大寫中文") or "").strip()
+        is_chinese_match, chinese_match_method = is_chinese_amount_match(ocr_chinese, std_chinese)
+        compare["金額大寫中文"] = {
+            "標準答案": std_chinese,
+            "OCR結果":  ocr_chinese,
+            "比對方式": chinese_match_method,
+            "是否一致": is_chinese_match
+        }
+
+        # 未稅金額
+        std_sales = standard.get("未稅金額", "").replace(",", "").strip()
+        ocr_sales = (llm_fields.get("未稅金額") or "").replace(",", "").strip()
+        compare["未稅金額"] = {
+            "標準答案": std_sales,
+            "OCR結果":  ocr_sales,
+            "是否一致": ocr_sales == std_sales
+        }
+
+        # 稅額
+        std_tax = standard.get("稅額", "").replace(",", "").strip()
+        ocr_tax = (llm_fields.get("稅額") or "").replace(",", "").strip()
+        compare["稅額"] = {
+            "標準答案": std_tax,
+            "OCR結果":  ocr_tax,
+            "是否一致": ocr_tax == std_tax
+        }
+
+        # 合計金額
+        std_total = standard.get("合計金額", "").replace(",", "").strip()
+        ocr_total = (llm_fields.get("合計金額") or "").replace(",", "").strip()
+        compare["合計金額"] = {
+            "標準答案": std_total,
+            "OCR結果":  ocr_total,
+            "是否一致": ocr_total == std_total
+        }
 
     # --- 8. 整體通過判斷：所有欄位都一致才算通過 ---
     compare["全部比對通過"] = all(
@@ -408,7 +493,7 @@ def extract_seller_company_name(page_text_clean):
             if next_line.startswith('方'):
                 is_seller_line = True
                 seller_content_idx = idx + 1
-        elif re.search(r'^營業人[:：]?', line):
+        elif re.search(r'^營業人[:：]', line):
             is_seller_line = True
 
         print(f"  [{idx}] normalized='{line}' | is_seller={is_seller_line}")
@@ -420,7 +505,7 @@ def extract_seller_company_name(page_text_clean):
         base_idx = seller_content_idx
         trigger_line = normalized_lines[seller_content_idx]
 
-        m = re.search(r'([\u4e00-\u9fff]{2,}(?:股份)?有限公司[\u4e00-\u9fff]*)', trigger_line)
+        m = re.search(r'([\u4e00-\u9fff]{2,10}(?:股份)?有限公司[\u4e00-\u9fff]*)', trigger_line)
         if m:
             company_name = m.group(1)
             print(f"  → 同行找到: '{company_name}'")
@@ -450,7 +535,7 @@ def extract_seller_company_name(page_text_clean):
                     accumulated += chinese_part
                     print(f"    [{next_idx}] 累積: '{accumulated}'")
 
-                m = re.search(r'([\u4e00-\u9fff]{2,}(?:股份)?有限公司[\u4e00-\u9fff]*)', accumulated)
+                m = re.search(r'([\u4e00-\u9fff]{2,10}(?:股份)?有限公司[\u4e00-\u9fff]*)', accumulated)
                 if m:
                     company_name = m.group(1)
                     base_idx = next_idx
@@ -1211,6 +1296,28 @@ for i, page in enumerate(pages):
     print(f"已轉換: {jpg_path}")
 
     # ---------------------------------
+    # ✅ 0. VLM 前置判斷：是否有多張發票
+    # ---------------------------------
+    print(f"\n===== 第 {i+1} 頁 VLM 多發票偵測 =====")
+    detection = detect_multi_invoice(page)
+    print(f"  → 發票張數: {detection.get('invoice_count')}")
+    print(f"  → 信心度:   {detection.get('confidence')}")
+    print(f"  → 原因:     {detection.get('reason')}")
+
+    if detection.get("has_multiple_invoices"):
+        print(f"⚠️  第 {i+1} 頁偵測到多張發票，跳過辨識，請人工處理")
+        all_pages_result.append({
+            "page":   i + 1,
+            "status": "skipped",
+            "reason": "偵測到多張發票，請人工處理",
+            "vlm_detection": detection
+        })
+        continue  # ✅ 跳過此頁，不進行 OCR
+
+    print(f"✅  第 {i+1} 頁為單張發票，繼續辨識")
+
+
+    # ---------------------------------
     # 1. OCR branch：執行文字辨識
     # ---------------------------------
     ocr_items = run_ocr(jpg_path)
@@ -1244,6 +1351,18 @@ for i, page in enumerate(pages):
     amount_validation = validate_amounts(table_data)
 
     # ---------------------------------
+    # ✅ 3.6 LLM 彙整欄位
+    # ---------------------------------
+    print(f"\n===== 第 {i+1} 頁 LLM 欄位擷取 =====")
+    llm_fields = extract_invoice_fields_by_llm(page_text_clean)
+    print(f"  年度期間:    {llm_fields.get('年度期間')}")
+    print(f"  金額大寫中文: {llm_fields.get('金額大寫中文')}")
+    print(f"  未稅金額:    {llm_fields.get('未稅金額')}")
+    print(f"  稅額:        {llm_fields.get('稅額')}")
+    print(f"  合計金額:    {llm_fields.get('合計金額')}")
+
+
+    # ---------------------------------
     # 4. Regex 檢核：統一編號驗證
     # ---------------------------------
     buyer_tax_id, seller_tax_id = extract_tax_id_by_context(page_text_clean)
@@ -1270,14 +1389,14 @@ for i, page in enumerate(pages):
 
     standard = standard_dict.get(lookup_invoice_no)
 
-    # 發票號碼找不到時，改用賣方統編從 Excel 反查
-    if standard is None and seller_tax_id:
-        for inv_no, std in standard_dict.items():
-            if std.get("廠商統編") == seller_tax_id:
-                standard          = std
-                lookup_invoice_no = inv_no
-                print(f"⚠️  發票號碼由 Excel 反查得到：{inv_no}（依賣方統編 {seller_tax_id} 比對）")
-                break
+    # # 發票號碼找不到時，改用賣方統編從 Excel 反查
+    # if standard is None and seller_tax_id:
+    #     for inv_no, std in standard_dict.items():
+    #         if std.get("廠商統編") == seller_tax_id:
+    #             standard          = std
+    #             lookup_invoice_no = inv_no
+    #             print(f"⚠️  發票號碼由 Excel 反查得到：{inv_no}（依賣方統編 {seller_tax_id} 比對）")
+    #             break
 
     if standard is None:
         print(f"⚠️  找不到發票號碼 [{lookup_invoice_no}] 的標準答案")
@@ -1289,7 +1408,8 @@ for i, page in enumerate(pages):
         seller_company_name,
         amount_validation,
         extracted_invoice_no,
-        standard
+        standard,
+        llm_fields
     )
     validation_result["與Excel比對結果"] = compare_result
 
