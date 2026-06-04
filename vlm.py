@@ -10,8 +10,8 @@ import numpy as np
 # =========================
 # VLM 設定
 # =========================
-VLLM_LLM_MODEL2 = "gemma-3-27b-it"
-VLLM_LLM_API_BASE2 = "http://10.2.5.111:8015/gemma-3-27b-it/v1"
+VLLM_LLM_MODEL2 = "gemma-4-26B-A4B-it"
+VLLM_LLM_API_BASE2 = "http://10.2.5.111:8015/gemma-4-26B-A4B-it/v1"
 
 POPPLER_PATH      = "Release-25.12.0-0/poppler-25.12.0/Library/bin"
 

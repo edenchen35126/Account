@@ -34,56 +34,287 @@ ocr = PaddleOCR(
 )
 
 # =========================
+# 讀取設定檔
+# =========================
+CONFIG_PATH = "config.json"
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+INPUT_PATH   = config["input_path"]
+EXCEL_PATH   = config["excel_path"]
+POPPLER_PATH = config["poppler_path"]
+FONT_PATH    = config["font_path"]
+DPI          = config.get("dpi", 700)
+PDF_PATH     = config["pdf_path"]
+PDF_NAME     = config["pdf_name"]
+
+# =========================
 # 簡體 → 繁體轉換器
 # =========================
 cc = OpenCC('s2t')  # s2t = Simplified to Traditional
 
-# =========================
-# 目標 PDF 設定
-# =========================
-pdf_path = "file/split_output/scan-00003/page_6.pdf"  # 要處理的 PDF 路徑
-pdf_name = "page_6"                                    # 輸出檔名前綴
+# # =========================
+# # 目標 PDF 設定
+# # =========================
+# pdf_path = "file/split_output/scan-00003/page_6.pdf"  # 要處理的 PDF 路徑
+# pdf_name = "page_6"                                    # 輸出檔名前綴
 
 # =========================
 # PDF → 圖片
 # =========================
 pages = convert_from_path(
-    pdf_path,
-    dpi=700,  # 解析度，越高品質越好但速度越慢，建議 300
-    poppler_path="Release-25.12.0-0/poppler-25.12.0/Library/bin"  # Poppler 執行檔路徑
+    PDF_PATH,
+    dpi=DPI,  # 解析度，越高品質越好但速度越慢，建議 300
+    poppler_path=POPPLER_PATH  # Poppler 執行檔路徑
 )
 
 
 
-# =========================
-# 目標檔案設定
-# =========================
-input_path = "file/invoices/page1_invoice3.png"  # 可以是 PDF 或圖片
-input_name = os.path.splitext(os.path.basename(input_path))[0]  # 自動取檔名
+# # =========================
+# # 目標檔案設定
+# # =========================
+# # input_path = "file/invoices/page1_invoice3.png"  # 可以是 PDF 或圖片
+# input_name = os.path.splitext(os.path.basename(INPUT_PATH))[0]  # 自動取檔名
+
+# # =========================
+# # PDF → 圖片 / 直接讀圖片
+# # =========================
+# IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+
+# ext = os.path.splitext(INPUT_PATH)[1].lower()
+
+# if ext == ".pdf":
+#     pages = convert_from_path(
+#         INPUT_PATH,
+#         dpi=DPI,
+#         poppler_path=POPPLER_PATH
+#     )
+#     print(f"PDF 模式：共 {len(pages)} 頁")
+
+# elif ext in IMAGE_EXTENSIONS:
+#     img_pil = Image.open(INPUT_PATH).convert("RGB")
+#     pages = [img_pil]  # 包成 list，讓後續迴圈邏輯不變
+#     print(f"圖片模式：{INPUT_PATH}")
+
+# else:
+#     raise ValueError(f"不支援的檔案格式：{ext}")
+
 
 # =========================
-# PDF → 圖片 / 直接讀圖片
+# 發票前綴對應檢核規則
 # =========================
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+# _FULL_RULES = ["發票號碼", "買方統編", "賣方統編", "買方公司名稱", "賣方公司名稱", "年度期間", "金額大寫中文", "未稅金額", "稅額", "合計金額"]
+_DETAIL_FULL   = ["品名", "數量", "單價", "金額"]   # 全部明細欄位
+_DETAIL_AMOUNT = ["品名", "金額"]                    # 只檢核品名+金額
 
-ext = os.path.splitext(input_path)[1].lower()
+_FULL_RULES = [
+    "發票號碼", "買方統編", "賣方統編", "買方公司名稱", "賣方公司名稱",
+    "金額大寫中文", "未稅金額", "稅額", "合計金額",
+    "明細項目"
+]
 
-if ext == ".pdf":
-    pages = convert_from_path(
-        input_path,
-        dpi=700,
-        poppler_path="Release-25.12.0-0/poppler-25.12.0/Library/bin"
-    )
-    print(f"PDF 模式：共 {len(pages)} 頁")
+INVOICE_PREFIX_RULES = {
+    "YW": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "YZ": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "ZM": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "YG": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "ZG": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "ZA": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "AY": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "BM": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "BF": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},  # ✅ 只檢核品名+金額
+    "BK": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+    "BP": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
+}
 
-elif ext in IMAGE_EXTENSIONS:
-    img_pil = Image.open(input_path).convert("RGB")
-    pages = [img_pil]  # 包成 list，讓後續迴圈邏輯不變
-    print(f"圖片模式：{input_path}")
+def compare_detail_items(ocr_items: list, std_items: list, active_detail_fields: list = None) -> dict:
+    if active_detail_fields is None:
+        active_detail_fields = ["品名", "數量", "單價", "金額"]
 
-else:
-    raise ValueError(f"不支援的檔案格式：{ext}")
+    if not std_items:
+        return {
+            "是否一致":  None,
+            "檢核欄位":  active_detail_fields,
+            "比對細節":  "標準答案未填寫明細項目，略過比對",
+            "失敗項目摘要": []
+        }
 
+    if not ocr_items:
+        return {
+            "是否一致":  False,
+            "檢核欄位":  active_detail_fields,
+            "比對細節":  "資料缺失",
+            "失敗項目摘要": []
+        }
+
+    if len(ocr_items) != len(std_items):
+        return {
+            "是否一致":  False,
+            "檢核欄位":  active_detail_fields,
+            "比對細節":  f"筆數不一致（標準:{len(std_items)}筆, OCR:{len(ocr_items)}筆）",
+            "失敗項目摘要": []
+        }
+
+    detail_results = []
+    all_match      = True
+    failed_items   = []
+
+    # ✅ 每個欄位的整體一致性（所有品項都一致才算True）
+    field_all_match = {key: True for key in active_detail_fields}
+
+    for idx, (ocr_item, std_item) in enumerate(zip(ocr_items, std_items)):
+        item_result = {}
+        item_match  = True
+
+        for key in active_detail_fields:
+            ocr_val = str(ocr_item.get(key) or "").replace(",", "").strip()
+            std_val = str(std_item.get(key) or "").replace(",", "").strip()
+
+            if key in ["數量", "單價", "金額"]:
+                ocr_num_str = re.search(r'[\d.]+', ocr_val)
+                std_num_str = re.search(r'[\d.]+', std_val)
+                try:
+                    ocr_num = float(ocr_num_str.group()) if ocr_num_str else None
+                    std_num = float(std_num_str.group()) if std_num_str else None
+                    if ocr_num is not None and std_num is not None:
+                        match   = (ocr_num == std_num)
+                        ocr_val = str(int(ocr_num)) if ocr_num == int(ocr_num) else str(ocr_num)
+                        std_val = str(int(std_num)) if std_num == int(std_num) else str(std_num)
+                    else:
+                        match = (ocr_val == std_val)
+                except ValueError:
+                    match = (ocr_val == std_val)
+            else:
+                match = (ocr_val == std_val)
+
+            if not match:
+                item_match = False
+                field_all_match[key] = False  # ✅ 該欄位有一筆失敗就標記
+
+            item_result[key] = {
+                "標準答案": std_val,
+                "OCR結果":  ocr_val,
+                "是否一致": match
+            }
+
+        item_result["此筆一致"] = item_match
+
+        if not item_match:
+            all_match = False
+            failed_fields_in_item = [
+                k for k in active_detail_fields
+                if not item_result.get(k, {}).get("是否一致", True)
+            ]
+            failed_items.append({
+                "第幾筆":   idx + 1,
+                "品名":     std_item.get("品名", ""),
+                "失敗欄位": failed_fields_in_item,
+                "詳細":     {k: item_result[k] for k in failed_fields_in_item}
+            })
+
+        detail_results.append(item_result)
+
+    # ✅ 每個欄位的整體摘要（跟未稅金額格式一樣）
+    field_summary = {}
+    for key in active_detail_fields:
+        std_vals = [str(item.get(key, "")).strip() for item in std_items]
+        ocr_vals = [str(item.get(key, "")).strip() for item in ocr_items]
+        field_summary[key] = {
+            "標準答案": std_vals if len(std_vals) > 1 else std_vals[0],
+            "OCR結果":  ocr_vals if len(ocr_vals) > 1 else ocr_vals[0],
+            "是否一致": field_all_match[key]
+        }
+
+    return {
+        "是否一致":    all_match,
+        "檢核欄位":    active_detail_fields,
+        "欄位摘要":    field_summary,      # ✅ 每個欄位整體一致性
+        "比對細節":    detail_results,     # 每筆明細詳細結果
+        "失敗項目摘要": failed_items        # 哪幾筆哪些欄位失敗
+    }
+
+
+def build_ocr_text_with_position(ocr_items: list) -> str:
+    """
+    將 OCR 結果轉成帶位置資訊的文字，傳給 LLM 輔助判斷
+    格式：[x座標,y座標] 文字內容
+    同一行（Y 座標相近）的文字會排在同一行
+    """
+    if not ocr_items:
+        return ""
+
+    # 依 Y 座標排序後分行
+    sorted_items = sort_bbox_texts(ocr_items, y_tolerance=15)
+
+    lines = []
+    current_line = []
+    current_y    = None
+
+    for item in sorted_items:
+        y1 = item["bbox"][1]
+        if current_y is None or abs(y1 - current_y) <= 15:
+            current_line.append(item)
+            current_y = y1
+        else:
+            lines.append(current_line)
+            current_line = [item]
+            current_y    = y1
+
+    if current_line:
+        lines.append(current_line)
+
+    # 每行組成「[x,y] 文字」格式
+    result_lines = []
+    for line in lines:
+        line_parts = []
+        for item in line:
+            x1, y1 = item["bbox"][0], item["bbox"][1]
+            line_parts.append(f"[{x1},{y1}]{item['text']}")
+        result_lines.append("  ".join(line_parts))
+
+    return "\n".join(result_lines)
+
+def get_validation_rules_by_prefix(invoice_no: str) -> dict:
+    """根據發票號碼前兩碼英文，決定要檢核的項目"""
+    if not invoice_no or len(invoice_no) < 2:
+        print(f"⚠️  無法取得發票前綴，轉人工審核")
+        return {"prefix": None, "rules": None, "detail_fields": None, "unknown": True}
+
+    prefix = invoice_no[:2].upper()
+
+    if prefix not in INVOICE_PREFIX_RULES:
+        print(f"⚠️  發票前綴 [{prefix}] 找不到對應檢核規則，轉人工審核")
+        return {"prefix": prefix, "rules": None, "detail_fields": None, "unknown": True}
+
+    prefix_config = INVOICE_PREFIX_RULES[prefix]
+    return {
+        "prefix":        prefix,
+        "rules":         prefix_config["rules"],
+        "detail_fields": prefix_config["detail_fields"],  # ✅ 新增
+        "unknown":       False
+    }
+
+def cv2_imwrite_unicode(path: str, img):
+    """支援中文路徑的 cv2.imwrite 替代函式"""
+    ext = os.path.splitext(path)[1]  # 取副檔名，如 .jpg
+    result, encoded = cv2.imencode(ext, img)
+    if result:
+        with open(path, "wb") as f:
+            f.write(encoded.tobytes())
+        return True
+    return False
+
+def normalize_company_name(name: str) -> str:
+    """正規化公司名稱，處理常見異體字與全半形差異"""
+    if not name:
+        return name
+    name = re.sub(r"\s+", "", name)
+    # ✅ 台 / 臺 視為相同
+    name = name.replace("臺", "台")
+    # ✅ 其他常見異體字
+    name = name.replace("說", "説")
+    name = name.replace("著", "着")
+    return name
 
 def is_chinese_amount_match(ocr_amount: str, std_amount: str) -> tuple[bool, str]:
     """
@@ -120,31 +351,48 @@ def is_chinese_amount_match(ocr_amount: str, std_amount: str) -> tuple[bool, str
 # 讀取 Excel 標準答案
 # =========================
 def load_excel_standard(excel_path):
-    """
-    讀取標準答案 Excel，以發票號碼為 key 建立查詢字典
-    
-    Args:
-        excel_path: Excel 檔案路徑
-    Returns:
-        dict: { 發票號碼: { 欄位: 值, ... } }
-    """
     df = pd.read_excel(excel_path, dtype=str)
-    df.columns = df.columns.str.strip()  # 去除欄位名稱前後空白
+    df.columns = df.columns.str.strip()
+    print(f"[DEBUG] Excel 欄位清單: {list(df.columns)}")  # ✅ 加這行確認欄位名稱
+    df = df.fillna("")
 
     standard_dict = {}
     for _, row in df.iterrows():
         invoice_no = str(row.get("發票號碼", "")).strip()
         if not invoice_no:
-            continue  # 跳過空白列
+            continue
+
+        # ✅ 解析明細項目 JSON 字串
+        detail_items = []
+        raw_detail = str(row.get("明細項目", "")).strip()
+
+        print(f"[DEBUG] 發票 [{invoice_no}] 明細項目原始值: '{raw_detail}'")  # ✅ 加這行
+
+        if raw_detail:
+            try:
+                parsed = json.loads(raw_detail)
+                if isinstance(parsed, list):
+                    # 數字欄位統一轉字串並去除逗號
+                    for item in parsed:
+                        detail_items.append({
+                            "品名": str(item.get("品名", "")).strip(),
+                            "數量": str(item.get("數量", "")).replace(",", "").strip(),
+                            "單價": str(item.get("單價", "")).replace(",", "").strip(),
+                            "金額": str(item.get("金額", "")).replace(",", "").strip(),
+                        })
+            except json.JSONDecodeError:
+                print(f"⚠️  發票 [{invoice_no}] 明細項目 JSON 解析失敗：{raw_detail}")
+
         standard_dict[invoice_no] = {
             "發票號碼":    invoice_no,
             "金額大寫中文": str(row.get("金額大寫中文", "")).strip(),
             "年度期間":    str(row.get("年度期間", "")).strip(),
-            "廠商統編":    str(row.get("廠商統編", "")).strip(),   # 即賣方統編
+            "廠商統編":    str(row.get("廠商統編", "")).strip(),
             "廠商名稱":    str(row.get("廠商名稱", "")).strip(),
-            "未稅金額":    str(row.get("未稅金額", "")).strip(),
-            "稅額":       str(row.get("稅額", "")).strip(),
-            "合計金額":    str(row.get("合計金額", "")).strip(),
+            "未稅金額":    str(row.get("未稅金額", "")).replace(",", "").strip(),
+            "稅額":       str(row.get("稅額", "")).replace(",", "").strip(),
+            "合計金額":    str(row.get("合計金額", "")).replace(",", "").strip(),
+            "明細項目":    detail_items   # ✅ 解析後的 list
         }
 
     print(f"已載入標準答案，共 {len(standard_dict)} 筆")
@@ -156,7 +404,9 @@ BUYER_COMPANY_NAME_FIXED = "燿華電子股份有限公司"
 # =========================
 # 與 Excel 標準答案比對
 # =========================
-def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, seller_company_name, amount_validation, extracted_invoice_no, standard, llm_fields=None):
+def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, seller_company_name,
+                           amount_validation, extracted_invoice_no, standard, llm_fields=None,
+                           active_rules=None, active_detail_fields=None):   # ✅ 新增參數
     """
     將 OCR 擷取結果與 Excel 標準答案逐欄比對
     
@@ -175,52 +425,58 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
 
     compare = {}
 
-    # --- 0. 發票號碼比對 ---
-    std_invoice_no = standard.get("發票號碼", "").strip()
-    compare["發票號碼"] = {
-        "標準答案": std_invoice_no,
-        "OCR結果":  extracted_invoice_no or "",
-        "是否一致": (extracted_invoice_no == std_invoice_no)
-    }
+    # ✅ 每個比對項目前先確認是否在 active_rules 內
+    if "發票號碼" in active_rules:
+        # --- 0. 發票號碼比對 ---
+        std_invoice_no = standard.get("發票號碼", "").strip()
+        compare["發票號碼"] = {
+            "標準答案": std_invoice_no,
+            "OCR結果":  extracted_invoice_no or "",
+            "是否一致": (extracted_invoice_no == std_invoice_no)
+        }
 
-    # --- 1. 買方統編：OCR 結果與固定值 05637971 比對 ---
-    compare["買方統編"] = {
-        "標準答案": BUYER_TAX_ID_FIXED,
-        "OCR結果":  buyer_tax_id or "",
-        "是否一致": (buyer_tax_id == BUYER_TAX_ID_FIXED)
-    }
+    if "買方統編" in active_rules:
+        # --- 1. 買方統編：OCR 結果與固定值 05637971 比對 ---
+        compare["買方統編"] = {
+            "標準答案": BUYER_TAX_ID_FIXED,
+            "OCR結果":  buyer_tax_id or "",
+            "是否一致": (buyer_tax_id == BUYER_TAX_ID_FIXED)
+        }
 
-    # --- 2. 買方公司名稱：OCR 結果與固定值比對 ---
-    is_match, match_method = is_company_name_match(buyer_company_name, BUYER_COMPANY_NAME_FIXED)
-    compare["買方公司名稱"] = {
-        "標準答案": BUYER_COMPANY_NAME_FIXED,
-        "OCR結果":  buyer_company_name or "",
-        "比對方式": match_method,
-        "是否一致": is_match
-    }
+    if "買方公司名稱" in active_rules:
+        # --- 2. 買方公司名稱：OCR 結果與固定值比對 ---
+        is_match, match_method = is_company_name_match(buyer_company_name, BUYER_COMPANY_NAME_FIXED)
+        compare["買方公司名稱"] = {
+            "標準答案": BUYER_COMPANY_NAME_FIXED,
+            "OCR結果":  buyer_company_name or "",
+            "比對方式": match_method,
+            "是否一致": is_match
+        }
     # compare["買方公司名稱"] = {
     #     "標準答案": BUYER_COMPANY_NAME_FIXED,
     #     "OCR結果":  buyer_company_name or "",
     #     "是否一致": (buyer_company_name == BUYER_COMPANY_NAME_FIXED)
     # }
 
-    # --- 3. 賣方統編：OCR 結果與 Excel 廠商統編比對 ---
-    std_seller_tax_id = standard.get("廠商統編", "").strip()
-    compare["賣方統編"] = {
-        "標準答案": std_seller_tax_id,
-        "OCR結果":  seller_tax_id or "",
-        "是否一致": (seller_tax_id == std_seller_tax_id)
-    }
+    if "賣方統編" in active_rules:
+        # --- 3. 賣方統編：OCR 結果與 Excel 廠商統編比對 ---
+        std_seller_tax_id = standard.get("廠商統編", "").strip()
+        compare["賣方統編"] = {
+            "標準答案": std_seller_tax_id,
+            "OCR結果":  seller_tax_id or "",
+            "是否一致": (seller_tax_id == std_seller_tax_id)
+        }
 
-    # --- 4. 賣方公司名稱比對 ---
-    std_seller_name = standard.get("廠商名稱", "").strip()
-    is_seller_match, seller_match_method = is_company_name_match(seller_company_name, std_seller_name)
-    compare["賣方公司名稱"] = {
-        "標準答案": std_seller_name,
-        "OCR結果":  seller_company_name or "",
-        "比對方式": seller_match_method,
-        "是否一致": is_seller_match
-    }
+    if "賣方公司名稱" in active_rules:
+        # --- 4. 賣方公司名稱比對 ---
+        std_seller_name = standard.get("廠商名稱", "").strip()
+        is_seller_match, seller_match_method = is_company_name_match(seller_company_name, std_seller_name)
+        compare["賣方公司名稱"] = {
+            "標準答案": std_seller_name,
+            "OCR結果":  seller_company_name or "",
+            "比對方式": seller_match_method,
+            "是否一致": is_seller_match
+        }
 
     # # --- 5. 未稅金額比對 ---
     # std_sales = standard.get("未稅金額", "").replace(",", "").strip()
@@ -251,52 +507,66 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
 
     # --- ✅ LLM 欄位比對 ---
     if llm_fields:
-        # 年度期間
-        std_period = standard.get("年度期間", "").strip()
-        ocr_period = (llm_fields.get("年度期間") or "").strip()
-        compare["年度期間"] = {
-            "標準答案": std_period,
-            "OCR結果":  ocr_period,
-            "是否一致": ocr_period == std_period
-        }
+        if "年度期間" in active_rules:
+            # 年度期間
+            std_period = standard.get("年度期間", "").strip()
+            ocr_period = (llm_fields.get("年度期間") or "").strip()
+            compare["年度期間"] = {
+                "標準答案": std_period,
+                "OCR結果":  ocr_period,
+                "是否一致": ocr_period == std_period
+            }
 
-        # 金額大寫中文
-        std_chinese = standard.get("金額大寫中文", "").strip()
-        ocr_chinese = (llm_fields.get("金額大寫中文") or "").strip()
-        is_chinese_match, chinese_match_method = is_chinese_amount_match(ocr_chinese, std_chinese)
-        compare["金額大寫中文"] = {
-            "標準答案": std_chinese,
-            "OCR結果":  ocr_chinese,
-            "比對方式": chinese_match_method,
-            "是否一致": is_chinese_match
-        }
+        if "金額大寫中文" in active_rules:
+            # 金額大寫中文
+            std_chinese = standard.get("金額大寫中文", "").strip()
+            ocr_chinese = (llm_fields.get("金額大寫中文") or "").strip()
+            is_chinese_match, chinese_match_method = is_chinese_amount_match(ocr_chinese, std_chinese)
+            compare["金額大寫中文"] = {
+                "標準答案": std_chinese,
+                "OCR結果":  ocr_chinese,
+                "比對方式": chinese_match_method,
+                "是否一致": is_chinese_match
+            }
 
-        # 未稅金額
-        std_sales = standard.get("未稅金額", "").replace(",", "").strip()
-        ocr_sales = (llm_fields.get("未稅金額") or "").replace(",", "").strip()
-        compare["未稅金額"] = {
-            "標準答案": std_sales,
-            "OCR結果":  ocr_sales,
-            "是否一致": ocr_sales == std_sales
-        }
+        if "未稅金額" in active_rules:
+            # 未稅金額
+            std_sales = standard.get("未稅金額", "").replace(",", "").strip()
+            ocr_sales = (llm_fields.get("未稅金額") or "").replace(",", "").strip()
+            compare["未稅金額"] = {
+                "標準答案": std_sales,
+                "OCR結果":  ocr_sales,
+                "是否一致": ocr_sales == std_sales
+            }
 
-        # 稅額
-        std_tax = standard.get("稅額", "").replace(",", "").strip()
-        ocr_tax = (llm_fields.get("稅額") or "").replace(",", "").strip()
-        compare["稅額"] = {
-            "標準答案": std_tax,
-            "OCR結果":  ocr_tax,
+
+        if "稅額" in active_rules:
+            # 稅額
+            std_tax = standard.get("稅額", "").replace(",", "").strip()
+            ocr_tax = (llm_fields.get("稅額") or "").replace(",", "").strip()
+            compare["稅額"] = {
+                "標準答案": std_tax,
+                "OCR結果":  ocr_tax,
             "是否一致": ocr_tax == std_tax
         }
 
-        # 合計金額
-        std_total = standard.get("合計金額", "").replace(",", "").strip()
-        ocr_total = (llm_fields.get("合計金額") or "").replace(",", "").strip()
-        compare["合計金額"] = {
-            "標準答案": std_total,
-            "OCR結果":  ocr_total,
-            "是否一致": ocr_total == std_total
-        }
+        if "合計金額" in active_rules:
+            # 合計金額
+            std_total = standard.get("合計金額", "").replace(",", "").strip()
+            ocr_total = (llm_fields.get("合計金額") or "").replace(",", "").strip()
+            compare["合計金額"] = {
+                "標準答案": std_total,
+                "OCR結果":  ocr_total,
+                "是否一致": ocr_total == std_total
+            }
+
+        if "明細項目" in active_rules:
+            std_items = standard.get("明細項目", [])
+            ocr_items = llm_fields.get("明細項目", [])
+            compare["明細項目"] = compare_detail_items(
+                ocr_items, std_items,
+                active_detail_fields=active_detail_fields   # ✅ 傳入
+            )
 
     # --- 8. 整體通過判斷：所有欄位都一致才算通過 ---
     compare["全部比對通過"] = all(
@@ -447,8 +717,11 @@ def is_company_name_match(ocr_name, standard_name):
     if not ocr_name or not standard_name:
         return False, "資料缺失"
 
-    ocr = re.sub(r"\s+", "", ocr_name)
-    std = re.sub(r"\s+", "", standard_name)
+    # ocr = re.sub(r"\s+", "", ocr_name)
+    # std = re.sub(r"\s+", "", standard_name)
+    # ✅ 先正規化再比對
+    ocr = normalize_company_name(ocr_name)
+    std = normalize_company_name(standard_name)
 
     # 1. 完全相等
     if ocr == std:
@@ -588,9 +861,9 @@ def extract_seller_company_name(page_text_clean):
 # =========================
 # 中文字型（視覺化用）
 # =========================
-font_path = r"C:\Windows\Fonts\msjh.ttc"
-font       = ImageFont.truetype(font_path, 28)   # 大字（摘要資訊）
-small_font = ImageFont.truetype(font_path, 20)   # 小字（OCR 標注）
+# font_path = r"C:\Windows\Fonts\msjh.ttc"
+font       = ImageFont.truetype(FONT_PATH, 28)   # 大字（摘要資訊）
+small_font = ImageFont.truetype(FONT_PATH, 20)   # 小字（OCR 標注）
 
 # =========================
 # 工具函式
@@ -1278,7 +1551,7 @@ def validate_amounts(table_data):
 # =========================
 # 載入 Excel 標準答案
 # =========================
-EXCEL_PATH = "file/會計憑證POC.xlsx"
+# EXCEL_PATH = "file/會計憑證POC.xlsx"
 standard_dict = load_excel_standard(EXCEL_PATH)
 
 # =========================
@@ -1291,8 +1564,9 @@ for i, page in enumerate(pages):
     img = np.array(page)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    jpg_path = f"jpg_pages/page_{i+1}_{pdf_name}.jpg"
-    cv2.imwrite(jpg_path, img)
+    jpg_path = f"jpg_pages/page_{i+1}_{PDF_NAME}.jpg"
+    # cv2.imwrite(jpg_path, img)
+    cv2_imwrite_unicode(jpg_path, img)
     print(f"已轉換: {jpg_path}")
 
     # ---------------------------------
@@ -1350,16 +1624,6 @@ for i, page in enumerate(pages):
     # ---------------------------------
     amount_validation = validate_amounts(table_data)
 
-    # ---------------------------------
-    # ✅ 3.6 LLM 彙整欄位
-    # ---------------------------------
-    print(f"\n===== 第 {i+1} 頁 LLM 欄位擷取 =====")
-    llm_fields = extract_invoice_fields_by_llm(page_text_clean)
-    print(f"  年度期間:    {llm_fields.get('年度期間')}")
-    print(f"  金額大寫中文: {llm_fields.get('金額大寫中文')}")
-    print(f"  未稅金額:    {llm_fields.get('未稅金額')}")
-    print(f"  稅額:        {llm_fields.get('稅額')}")
-    print(f"  合計金額:    {llm_fields.get('合計金額')}")
 
 
     # ---------------------------------
@@ -1387,6 +1651,40 @@ for i, page in enumerate(pages):
     extracted_invoice_no = extracted_data.get("發票號碼")
     lookup_invoice_no    = extracted_invoice_no
 
+    # ✅ 依發票前兩碼決定檢核規則
+    prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no)
+    print(f"\n  發票前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
+
+    if prefix_rule["prefix"] is None:
+        print(f"⚠️  無法取得發票前綴，跳過此頁")
+        all_pages_result.append({
+            "page":   i + 1,
+            "status": "skipped",
+            "reason": "無法取得發票號碼前綴"
+        })
+        continue
+
+    # ✅ 前綴找不到對應規則，轉人工審核
+    if prefix_rule.get("unknown"):
+        all_pages_result.append({
+            "page":   i + 1,
+            "status": "manual_review",
+            "reason": f"發票前綴 [{prefix_rule['prefix']}] 無對應檢核規則"
+        })
+        continue
+
+    # ---------------------------------
+    # ✅ 3.6 LLM 彙整欄位
+    # ---------------------------------
+    print(f"\n===== 第 {i+1} 頁 LLM 欄位擷取 =====")
+    ocr_text_with_position = build_ocr_text_with_position(ocr_items)
+    llm_fields = extract_invoice_fields_by_llm(ocr_text_with_position)
+    print(f"  年度期間:    {llm_fields.get('年度期間')}")
+    print(f"  金額大寫中文: {llm_fields.get('金額大寫中文')}")
+    print(f"  未稅金額:    {llm_fields.get('未稅金額')}")
+    print(f"  稅額:        {llm_fields.get('稅額')}")
+    print(f"  合計金額:    {llm_fields.get('合計金額')}")
+
     standard = standard_dict.get(lookup_invoice_no)
 
     # # 發票號碼找不到時，改用賣方統編從 Excel 反查
@@ -1409,7 +1707,9 @@ for i, page in enumerate(pages):
         amount_validation,
         extracted_invoice_no,
         standard,
-        llm_fields
+        llm_fields,
+        active_rules=prefix_rule["rules"],   # ✅ 傳入檢核項目清單
+        active_detail_fields=prefix_rule["detail_fields"]   # ✅ 新增
     )
     validation_result["與Excel比對結果"] = compare_result
 
@@ -1427,7 +1727,16 @@ for i, page in enumerate(pages):
 
     print(f"\n第 {i+1} 頁 與標準答案比對:")
     for k, v in compare_result.items():
-        print(f"  {k}: {v}")
+        if k == "明細項目" and isinstance(v, dict):
+            print(f"  明細項目 是否一致: {v.get('是否一致')}")
+            # ✅ 印出每個欄位摘要
+            for field, summary in v.get("欄位摘要", {}).items():
+                print(f"    {field}: {summary}")
+            # ✅ 印出失敗項目
+            for f in v.get("失敗項目摘要", []):
+                print(f"    ❌ 第{f['第幾筆']}筆 [{f['品名']}] 失敗欄位：{f['失敗欄位']}")
+        else:
+            print(f"  {k}: {v}")
 
     print(f"\n第 {i+1} 頁 TSR cells 數量: {len(cells)}")
     print("-" * 50)
@@ -1459,13 +1768,16 @@ for i, page in enumerate(pages):
     )
 
     # 儲存視覺化結果
-    save_path = f"output/page_{i+1}_{pdf_name}.jpg"
-    cv2.imwrite(save_path, final_img)
+    save_path = f"output/page_{i+1}_{PDF_NAME}.jpg"
+    # cv2.imwrite(save_path, final_img)
+    cv2_imwrite_unicode(save_path, final_img)
     print(f"輸出: {save_path}")
 
     # 儲存水平線與垂直線遮罩（Debug 用）
-    cv2.imwrite(f"output/page_{i+1}_{pdf_name}_horizontal.jpg", horizontal_img)
-    cv2.imwrite(f"output/page_{i+1}_{pdf_name}_vertical.jpg",   vertical_img)
+    # cv2.imwrite(f"output/page_{i+1}_{PDF_NAME}_horizontal.jpg", horizontal_img)
+    # cv2.imwrite(f"output/page_{i+1}_{PDF_NAME}_vertical.jpg",   vertical_img)
+    cv2_imwrite_unicode(f"output/page_{i+1}_{PDF_NAME}_horizontal.jpg", horizontal_img)
+    cv2_imwrite_unicode(f"output/page_{i+1}_{PDF_NAME}_vertical.jpg",   vertical_img)
 
     # ---------------------------------
     # 7. JSON 輸出（單頁）
