@@ -5,12 +5,9 @@ from openai import OpenAI
 # =========================
 # LLM 設定
 # =========================
-VLLM_LLM_MODEL    = "gemma-3-27b-it"
-VLLM_LLM_API_BASE = "http://10.2.5.111:8015/gemma-3-27b-it/v1"
-VLLM_API_KEY      = "sk-abc123DEF456ghi789JKL012mno345PQR678stu901VWX234yz"
 
-VLLM_LLM_MODEL = "gpt-oss-120b"
-VLLM_LLM_API_BASE = "http://10.2.5.111:8015/gpt-oss-120b/v1"
+VLLM_LLM_MODEL = "gemma-4-26B-A4B-it"
+VLLM_LLM_API_BASE = "http://10.2.5.111:8015/gemma-4-26B-A4B-it/v1"
 VLLM_API_KEY      = "sk-abc123DEF456ghi789JKL012mno345PQR678stu901VWX234yz"
 
 client = OpenAI(
@@ -166,6 +163,126 @@ def _empty_llm_result() -> dict:
         "明細項目":    [],
         "raw_response": None
     }
+
+def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
+    """
+    針對比對失敗的欄位，重新請 LLM 擷取
+    Args:
+        ocr_text     : OCR 辨識後的文字（含座標）
+        failed_fields: 需要重新擷取的欄位清單
+    Returns:
+        dict: 只包含 failed_fields 的重新擷取結果
+    """
+
+    # 各欄位的說明
+    field_instructions = {
+        "年度期間": """- 年度期間：格式為「民國年份年MM-MM月」，例如「115年03-04月」
+   - 若只有開立日期，西元年 - 1911 = 民國年，月份依雙月制推算""",
+
+        "金額大寫中文": """- 金額大寫中文：只輸出中文大寫金額本身，不要包含「新臺幣」前綴""",
+
+        "未稅金額": """- 未稅金額：未含稅的銷售金額（純數字）""",
+
+        "稅額": """- 稅額：營業稅金額（純數字）""",
+
+        "合計金額": """- 合計金額：含稅總計金額（純數字）""",
+
+        "明細項目": """- 明細項目：每筆包含品名、數量、單價、金額，輸出為 JSON 陣列
+   - 利用Y座標判斷同一列的品名、數量、單價、金額
+   - 品名可能跨多行，請合併成完整品名
+   - 料號數字可能獨立在品名上方，請將料號與品名合併
+   - 數量可能含單位（如 "40.0 LT"），請完整保留
+   - 單價、金額為純數字（去除逗號）
+   - 只擷取實際品項明細列，不包含合計列、稅額列""",
+
+      # ✅ 新增 OCR+Regex 欄位
+        "發票號碼":    """- 發票號碼：2個英文字母 + 8個數字，例如「BK03970041」
+   - 注意可能因換行被切斷，請從上下文還原完整號碼""",
+        "買方統編":    """- 買方統編（買方統一編號）：8位數字
+   - 通常在「買方」或「買」字附近，可能因換行與公司名稱分開""",
+        "賣方統編":    """- 賣方統編（賣方統一編號）：8位數字
+   - 通常在發票底部或賣方公司名稱附近""",
+        "買方公司名稱": """- 買方公司名稱：完整公司名稱
+   - 通常在「買方」或「方:」後面，可能因換行被切斷，請還原完整名稱""",
+        "賣方公司名稱": """- 賣方公司名稱：完整公司名稱
+   - 通常在發票抬頭或底部，可能因換行被切斷，請還原完整名稱""",
+    }
+
+    # 只針對失敗欄位
+    instructions = "\n".join([
+        field_instructions[f] for f in failed_fields if f in field_instructions
+    ])
+
+    # 建立 JSON 格式範例
+    json_template = {}
+    for field in failed_fields:
+        if field == "明細項目":
+            json_template[field] = [{"品名": "<值或null>", "數量": "<原始文字或null>", "單價": "<純數字或null>", "金額": "<純數字或null>"}]
+        else:
+            json_template[field] = "<值或null>"
+
+    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x座標,y座標]文字內容」。
+請利用座標資訊輔助判斷版面結構：
+- Y座標相近的文字代表在同一行
+- X座標較小在左，X座標較大在右
+
+請只擷取以下欄位（其他欄位不需要）：
+{instructions}
+
+請用以下 JSON 格式回答，找不到的欄位填 null，不要加任何多餘說明：
+{json.dumps(json_template, ensure_ascii=False, indent=2)}
+
+OCR 文字如下：
+---
+{ocr_text}
+---"""
+
+    try:
+        print(f"[LLM重試] 針對欄位重新擷取: {failed_fields}")
+
+        response = client.chat.completions.create(
+            model=VLLM_LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            temperature=0.0
+        )
+
+        content = response.choices[0].message.content
+        if not content:
+            print(f"⚠️  [LLM重試] 回應為空")
+            return {}
+
+        raw_text = content.strip()
+        print(f"[LLM重試] 回應:\n{raw_text}\n")
+
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if not json_match:
+            print(f"⚠️  [LLM重試] 找不到 JSON")
+            return {}
+
+        result = json.loads(json_match.group())
+
+        # 數字欄位清理
+        for key in ["未稅金額", "稅額", "合計金額"]:
+            if result.get(key):
+                result[key] = str(result[key]).replace(",", "").strip()
+
+        # 明細項目清理
+        items = result.get("明細項目", [])
+        if isinstance(items, list):
+            for item in items:
+                for key in ["單價", "金額"]:
+                    if item.get(key):
+                        item[key] = str(item[key]).replace(",", "").strip()
+
+        return result
+
+    except json.JSONDecodeError as e:
+        print(f"⚠️  [LLM重試] JSON 解析失敗：{e}")
+        return {}
+    except Exception as e:
+        print(f"⚠️  [LLM重試] 呼叫失敗：{e}")
+        return {}
 
 
 # # =========================

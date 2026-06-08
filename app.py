@@ -13,9 +13,10 @@ from PIL import Image, ImageDraw, ImageFont  # 圖片繪製與字型
 import pandas as pd                      # Excel 讀取
 
 # ✅ 引入 VLM 判斷函式
-from vlm import detect_multi_invoice
+from vlm import detect_multi_invoice, extract_fields_from_image_region
 # ✅ 引入 LLM 擷取函式
-from llm import extract_invoice_fields_by_llm
+from llm import extract_invoice_fields_by_llm, reextract_specific_fields
+
 
 # =========================
 # 建立資料夾
@@ -44,7 +45,7 @@ INPUT_PATH   = config["input_path"]
 EXCEL_PATH   = config["excel_path"]
 POPPLER_PATH = config["poppler_path"]
 FONT_PATH    = config["font_path"]
-DPI          = config.get("dpi", 700)
+DPI          = config.get("dpi", 1000)
 PDF_PATH     = config["pdf_path"]
 PDF_NAME     = config["pdf_name"]
 
@@ -1699,18 +1700,151 @@ for i, page in enumerate(pages):
     if standard is None:
         print(f"⚠️  找不到發票號碼 [{lookup_invoice_no}] 的標準答案")
 
+    # ✅ 定義哪些欄位屬於 OCR+Regex、哪些屬於 LLM
+    OCR_REGEX_FIELDS = ["發票號碼", "買方統編", "賣方統編", "買方公司名稱", "賣方公司名稱"]
+    LLM_FIELDS       = ["年度期間", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目"]
+    ALL_RETRY_FIELDS = OCR_REGEX_FIELDS + LLM_FIELDS
+
+    def get_failed_fields(compare_result: dict, target_fields: list) -> list:
+        """找出比對失敗且在 target_fields 內的欄位"""
+        failed = []
+        for k, v in compare_result.items():
+            if k not in target_fields:
+                continue
+            if isinstance(v, dict) and v.get("是否一致") == False:
+                failed.append(k)
+        return failed
+
+    # ✅ 第一次比對
     compare_result = compare_with_standard(
-        buyer_tax_id,
-        seller_tax_id,
-        buyer_company_name,
-        seller_company_name,
-        amount_validation,
-        extracted_invoice_no,
-        standard,
-        llm_fields,
-        active_rules=prefix_rule["rules"],   # ✅ 傳入檢核項目清單
-        active_detail_fields=prefix_rule["detail_fields"]   # ✅ 新增
+        buyer_tax_id, seller_tax_id,
+        buyer_company_name, seller_company_name,
+        amount_validation, extracted_invoice_no,
+        standard, llm_fields,
+        active_rules=prefix_rule["rules"],
+        active_detail_fields=prefix_rule["detail_fields"]
     )
+
+    # ✅ LLM 重試（OCR+Regex 和 LLM 欄位都納入）
+    MAX_FIELD_RETRY = 2
+    for retry_attempt in range(MAX_FIELD_RETRY):
+
+        failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+        if not failed_fields:
+            print(f"✅ 所有欄位比對通過，不需重試")
+            break
+
+        print(f"\n[LLM重試] 第{retry_attempt+1}次，失敗欄位：{failed_fields}")
+
+        retry_result = reextract_specific_fields(ocr_text_with_position, failed_fields)
+        if not retry_result:
+            print(f"⚠️  [LLM重試] 回傳空值，放棄重試")
+            break
+
+        # ✅ 更新對應來源的變數
+        for field in failed_fields:
+            val = retry_result.get(field)
+            if val is None:
+                continue
+            print(f"[LLM重試] 更新欄位 [{field}]: → {val}")
+
+            if field == "發票號碼":
+                extracted_invoice_no = val
+            elif field == "買方統編":
+                buyer_tax_id = val
+            elif field == "賣方統編":
+                seller_tax_id = val
+            elif field == "買方公司名稱":
+                buyer_company_name = val
+            elif field == "賣方公司名稱":
+                seller_company_name = val
+            else:
+                # LLM 欄位直接更新 llm_fields
+                llm_fields[field] = val
+
+        # 重新比對
+        compare_result = compare_with_standard(
+            buyer_tax_id, seller_tax_id,
+            buyer_company_name, seller_company_name,
+            amount_validation, extracted_invoice_no,
+            standard, llm_fields,
+            active_rules=prefix_rule["rules"],
+            active_detail_fields=prefix_rule["detail_fields"]
+        )
+
+        still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+        if still_failed:
+            print(f"[LLM重試] 第{retry_attempt+1}次後仍失敗：{still_failed}")
+        else:
+            print(f"[LLM重試] 第{retry_attempt+1}次後全部通過 ✅")
+            break
+
+    # ✅ VLM 保底（LLM 重試後仍失敗）
+    VLM_MAX_RETRY        = 2
+    final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+    if final_failed_fields:
+        print(f"\n[VLM保底] LLM重試{MAX_FIELD_RETRY}次仍失敗：{final_failed_fields}")
+        print(f"[VLM保底] 改用 VLM 圖片理解，最多重試 {VLM_MAX_RETRY} 次...")
+
+        vlm_current_fields = list(final_failed_fields)
+
+        for vlm_attempt in range(1, VLM_MAX_RETRY + 1):
+            print(f"\n[VLM保底] 第{vlm_attempt}次，擷取欄位：{vlm_current_fields}")
+
+            vlm_result = extract_fields_from_image_region(page, vlm_current_fields)
+
+            if not vlm_result:
+                print(f"⚠️  [VLM保底] 第{vlm_attempt}次回傳空值")
+                if vlm_attempt == VLM_MAX_RETRY:
+                    validation_result["需人工審核欄位"] = vlm_current_fields
+                continue
+
+            # ✅ 更新對應欄位變數
+            for field in vlm_current_fields:
+                val = vlm_result.get(field)
+                if val is None:
+                    continue
+                print(f"[VLM保底] 第{vlm_attempt}次 更新欄位 [{field}]: → {val}")
+
+                if field == "發票號碼":
+                    extracted_invoice_no = val
+                elif field == "買方統編":
+                    buyer_tax_id = val
+                elif field == "賣方統編":
+                    seller_tax_id = val
+                elif field == "買方公司名稱":
+                    buyer_company_name = val
+                elif field == "賣方公司名稱":
+                    seller_company_name = val
+                else:
+                    llm_fields[field] = val
+
+            # ✅ 重新比對，確認內容是否正確
+            compare_result = compare_with_standard(
+                buyer_tax_id, seller_tax_id,
+                buyer_company_name, seller_company_name,
+                amount_validation, extracted_invoice_no,
+                standard, llm_fields,
+                active_rules=prefix_rule["rules"],
+                active_detail_fields=prefix_rule["detail_fields"]
+            )
+
+            vlm_still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+
+            if not vlm_still_failed:
+                print(f"[VLM保底] 第{vlm_attempt}次比對通過 ✅")
+                break
+
+            print(f"[VLM保底] 第{vlm_attempt}次比對後仍失敗：{vlm_still_failed}")
+
+            if vlm_attempt == VLM_MAX_RETRY:
+                print(f"[VLM保底] 已達最大重試次數（{VLM_MAX_RETRY}次），轉人工審核")
+                validation_result["需人工審核欄位"] = vlm_still_failed
+            else:
+                # ✅ 下一輪只針對仍失敗的欄位
+                vlm_current_fields = vlm_still_failed
+                print(f"[VLM保底] 下一次只針對失敗欄位重試：{vlm_current_fields}")
+
     validation_result["與Excel比對結果"] = compare_result
 
     # ---------------------------------
