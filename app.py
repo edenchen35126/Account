@@ -9,13 +9,13 @@ import numpy as np                       # 數值運算
 import os                                # 檔案系統操作
 import json                              # JSON 讀寫
 import re                                # 正則表達式
-from PIL import Image, ImageDraw, ImageFont  # 圖片繪製與字型
+from PIL import Image, ImageDraw, ImageFont  , ImageEnhance, ImageFilter # 圖片繪製與字型
 import pandas as pd                      # Excel 讀取
 
 # ✅ 引入 VLM 判斷函式
-from vlm import detect_multi_invoice, extract_fields_from_image_region
+from vlm import detect_multi_invoice, extract_fields_from_image_region, crop_image_region
 # ✅ 引入 LLM 擷取函式
-from llm import extract_invoice_fields_by_llm, reextract_specific_fields
+from llm import extract_invoice_fields_by_llm, reextract_specific_fields, locate_field_region_by_llm
 
 
 # =========================
@@ -1791,7 +1791,35 @@ for i, page in enumerate(pages):
         for vlm_attempt in range(1, VLM_MAX_RETRY + 1):
             print(f"\n[VLM保底] 第{vlm_attempt}次，擷取欄位：{vlm_current_fields}")
 
-            vlm_result = extract_fields_from_image_region(page, vlm_current_fields)
+            # ✅ 第2次起：先讓 LLM 定位失敗欄位區域，裁切後再給 VLM
+            if vlm_attempt >= 2:
+                print(f"[VLM保底] 嘗試 LLM 區域定位裁切...")
+                bbox_result = locate_field_region_by_llm(ocr_text_with_position, vlm_current_fields)
+
+                if bbox_result and all(k in bbox_result for k in ["x1", "y1", "x2", "y2"]):
+                    print(f"[VLM保底] LLM 定位結果：{bbox_result}（reason: {bbox_result.get('reason', '')}）")
+
+                    cropped = crop_image_region(
+                        page,
+                        [bbox_result["x1"], bbox_result["y1"], bbox_result["x2"], bbox_result["y2"]],
+                        padding=0
+                    )
+                    vlm_input_image = cropped
+
+                    # ✅ 儲存裁切圖片供 debug 確認
+                    os.makedirs("vlm_crop_debug", exist_ok=True)
+                    crop_save_path = f"vlm_crop_debug/page{i+1}_attempt{vlm_attempt}_{'_'.join(vlm_current_fields)}.png"
+                    cropped.save(crop_save_path)
+                    print(f"[VLM保底] 裁切圖片已儲存：{crop_save_path}，尺寸：{cropped.size}")
+
+                else:
+                    print(f"[VLM保底] LLM 定位失敗，改用整張圖")
+                    vlm_input_image = page
+            else:
+                # 第1次：整張圖
+                vlm_input_image = page
+
+            vlm_result = extract_fields_from_image_region(vlm_input_image, vlm_current_fields)
 
             if not vlm_result:
                 print(f"⚠️  [VLM保底] 第{vlm_attempt}次回傳空值")

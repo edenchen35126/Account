@@ -283,6 +283,96 @@ OCR 文字如下：
     except Exception as e:
         print(f"⚠️  [LLM重試] 呼叫失敗：{e}")
         return {}
+    
+
+def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list) -> dict:
+    """
+    讓 LLM 根據 OCR 座標文字，推算失敗欄位在圖片中的大概區域（bounding box）
+    回傳格式：{"x1": int, "y1": int, "x2": int, "y2": int}
+    座標單位與 OCR 輸出的 [x, y] 座標一致，並已含擴展邊界
+    """
+
+    field_desc = {
+        "明細項目":    "發票明細表格區域，包含品名、數量、單價、金額欄位的所有列（含表頭與最後一列）",
+        "金額大寫中文": "中文大寫金額所在區域",
+        "未稅金額":    "未稅金額數字所在區域",
+        "稅額":       "稅額數字所在區域",
+        "合計金額":    "合計金額數字所在區域",
+        "發票號碼":    "發票號碼（英文+數字）所在區域",
+        "買方公司名稱": "買方公司名稱所在區域",
+        "賣方公司名稱": "賣方公司名稱所在區域",
+        "買方統編":    "買方統一編號（8位數字）所在區域",
+        "賣方統編":    "賣方統一編號（8位數字）所在區域",
+    }
+
+    targets = "\n".join([
+        f"- {f}：{field_desc.get(f, f)}" for f in failed_fields
+    ])
+
+    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x座標,y座標]文字內容」。
+
+請判斷下列欄位在圖片中的位置，回傳一個能完整涵蓋所有欄位的矩形區域（bounding box）：
+
+目標欄位：
+{targets}
+
+重要注意事項：
+- OCR 座標只標記文字的起始位置，實際內容（尤其是表格右側欄位）可能延伸更遠
+- 請在找到的座標範圍基礎上，四個方向各額外擴展約 200 像素的安全邊界
+- 寧可框大一點，也不要切到內容
+
+請回傳以下 JSON 格式（座標單位與 OCR 座標相同，已含安全邊界）：
+{{
+  "x1": <最左邊x座標 再往左擴200，整數>,
+  "y1": <最上方y座標 再往上擴200，整數>,
+  "x2": <最右邊x座標 再往右擴200，整數>,
+  "y2": <最下方y座標 再往下擴200，整數>,
+  "reason": "<簡短說明判斷依據>"
+}}
+
+只回傳 JSON，不要加任何說明。
+
+OCR 文字如下：
+---
+{ocr_text_with_position}
+---"""
+
+    try:
+        response = client.chat.completions.create(
+            model=VLLM_LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0.0
+        )
+
+        content = (response.choices[0].message.content or "").strip()
+        print(f"[LLM區域定位] 回應：{content}")
+
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            print("⚠️  [LLM區域定位] 找不到 JSON")
+            return {}
+
+        result = json.loads(json_match.group())
+
+        # 確保都是整數
+        for key in ["x1", "y1", "x2", "y2"]:
+            if key in result:
+                result[key] = int(result[key])
+
+        # ✅ 程式側再加一層保險擴展，以防 LLM 沒有確實擴展
+        EXTRA_MARGIN = 150
+        result["x1"] = max(0, result.get("x1", 0) - EXTRA_MARGIN)
+        result["y1"] = max(0, result.get("y1", 0) - EXTRA_MARGIN)
+        result["x2"] = result.get("x2", 0) + EXTRA_MARGIN
+        result["y2"] = result.get("y2", 0) + EXTRA_MARGIN
+
+        print(f"[LLM區域定位] 擴展後座標：x1={result['x1']} y1={result['y1']} x2={result['x2']} y2={result['y2']}")
+        return result
+
+    except Exception as e:
+        print(f"⚠️  [LLM區域定位] 失敗：{e}")
+        return {}
 
 
 # # =========================
