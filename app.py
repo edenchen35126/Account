@@ -9,13 +9,20 @@ import numpy as np                       # 數值運算
 import os                                # 檔案系統操作
 import json                              # JSON 讀寫
 import re                                # 正則表達式
-from PIL import Image, ImageDraw, ImageFont  # 圖片繪製與字型
+from PIL import Image, ImageDraw, ImageFont  , ImageEnhance, ImageFilter # 圖片繪製與字型
 import pandas as pd                      # Excel 讀取
 
 # ✅ 引入 VLM 判斷函式
-from vlm import detect_multi_invoice
+from vlm import detect_multi_invoice, extract_fields_from_image_region, crop_image_region
 # ✅ 引入 LLM 擷取函式
-from llm import extract_invoice_fields_by_llm
+from llm import (
+    extract_invoice_fields_by_llm,
+    reextract_specific_fields,
+    locate_field_region_by_llm,
+    determine_tax_type_by_llm,
+    compare_chinese_amount_meaning_by_llm,
+)
+
 
 # =========================
 # 建立資料夾
@@ -44,7 +51,7 @@ INPUT_PATH   = config["input_path"]
 EXCEL_PATH   = config["excel_path"]
 POPPLER_PATH = config["poppler_path"]
 FONT_PATH    = config["font_path"]
-DPI          = config.get("dpi", 700)
+DPI          = config.get("dpi", 1000)
 PDF_PATH     = config["pdf_path"]
 PDF_NAME     = config["pdf_name"]
 
@@ -101,31 +108,24 @@ pages = convert_from_path(
 
 
 # =========================
-# 發票前綴對應檢核規則
+# 發票前綴對應檢核規則（從 config.json 讀取）
 # =========================
-# _FULL_RULES = ["發票號碼", "買方統編", "賣方統編", "買方公司名稱", "賣方公司名稱", "年度期間", "金額大寫中文", "未稅金額", "稅額", "合計金額"]
-_DETAIL_FULL   = ["品名", "數量", "單價", "金額"]   # 全部明細欄位
-_DETAIL_AMOUNT = ["品名", "金額"]                    # 只檢核品名+金額
+_DETAIL_PRESETS = config.get("detail_field_presets", {
+    "FULL":   ["品名", "數量", "單價", "金額"],
+    "AMOUNT": ["品名", "金額"]
+})
 
-_FULL_RULES = [
-    "發票號碼", "買方統編", "賣方統編", "買方公司名稱", "賣方公司名稱",
-    "金額大寫中文", "未稅金額", "稅額", "合計金額",
-    "明細項目"
-]
+INVOICE_PREFIX_RULES = {}
+for _group in config.get("invoice_prefix_groups", []):
+    _preset_key    = _group.get("detail_fields", "FULL")
+    _detail_fields = _DETAIL_PRESETS.get(_preset_key, _DETAIL_PRESETS["FULL"])
+    for _prefix in _group.get("prefixes", []):
+        INVOICE_PREFIX_RULES[_prefix] = {
+            "rules":         _group["rules"],
+            "detail_fields": _detail_fields
+        }
 
-INVOICE_PREFIX_RULES = {
-    "YW": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "YZ": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "ZM": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "YG": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "ZG": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "ZA": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "AY": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "BM": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "BF": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},  # ✅ 只檢核品名+金額
-    "BK": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-    "BP": {"rules": _FULL_RULES, "detail_fields": _DETAIL_FULL},
-}
+
 
 def compare_detail_items(ocr_items: list, std_items: list, active_detail_fields: list = None) -> dict:
     if active_detail_fields is None:
@@ -231,6 +231,77 @@ def compare_detail_items(ocr_items: list, std_items: list, active_detail_fields:
         "欄位摘要":    field_summary,      # ✅ 每個欄位整體一致性
         "比對細節":    detail_results,     # 每筆明細詳細結果
         "失敗項目摘要": failed_items        # 哪幾筆哪些欄位失敗
+    }
+
+
+def compare_detail_items_has_value(ocr_items: list, active_detail_fields: list = None) -> dict:
+    """
+    明細項目新邏輯：只要每筆品項中各欄位有值就通過，不需與 Excel 比對。
+
+    Args:
+        ocr_items:            OCR 彙整後的明細項目 list
+        active_detail_fields: 要檢核的欄位清單（品名、數量、單價、金額）
+    Returns:
+        dict: 檢核結果
+    """
+    if active_detail_fields is None:
+        active_detail_fields = ["品名", "數量", "單價", "金額"]
+
+    if not ocr_items:
+        return {
+            "是否一致":  False,
+            "檢核欄位":  active_detail_fields,
+            "比對細節":  "OCR未擷取到明細項目",
+            "失敗項目摘要": []
+        }
+
+    all_pass    = True
+    failed_items = []
+    detail_results = []
+
+    for idx, ocr_item in enumerate(ocr_items):
+        item_result = {}
+        item_pass   = True
+
+        for key in active_detail_fields:
+            val = str(ocr_item.get(key) or "").replace(",", "").strip()
+            has_value = bool(val)
+            if not has_value:
+                item_pass = False
+            item_result[key] = {
+                "OCR結果":  val,
+                "是否一致": has_value
+            }
+
+        item_result["此筆一致"] = item_pass
+
+        if not item_pass:
+            all_pass = False
+            empty_fields = [k for k in active_detail_fields if not item_result[k]["是否一致"]]
+            failed_items.append({
+                "第幾筆":   idx + 1,
+                "品名":     str(ocr_item.get("品名", "")),
+                "失敗欄位": empty_fields
+            })
+
+        detail_results.append(item_result)
+
+    # 欄位摘要（彙整每個欄位的 OCR 值清單）
+    field_summary = {}
+    for key in active_detail_fields:
+        ocr_vals = [str(item.get(key, "")).strip() for item in ocr_items]
+        field_all_pass = all(bool(v) for v in ocr_vals)
+        field_summary[key] = {
+            "OCR結果":  ocr_vals if len(ocr_vals) > 1 else (ocr_vals[0] if ocr_vals else ""),
+            "是否一致": field_all_pass
+        }
+
+    return {
+        "是否一致":    all_pass,
+        "檢核欄位":    active_detail_fields,
+        "欄位摘要":    field_summary,
+        "比對細節":    detail_results,
+        "失敗項目摘要": failed_items
     }
 
 
@@ -406,16 +477,28 @@ BUYER_COMPANY_NAME_FIXED = "燿華電子股份有限公司"
 # =========================
 def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, seller_company_name,
                            amount_validation, extracted_invoice_no, standard, llm_fields=None,
-                           active_rules=None, active_detail_fields=None):   # ✅ 新增參數
+                           active_rules=None, active_detail_fields=None,
+                           tax_type=None, tax_found=False,
+                           std_sales_amount=None, std_tax_amount=None, std_total_amount=None):
     """
-    將 OCR 擷取結果與 Excel 標準答案逐欄比對
-    
+    將 OCR 擷取結果與標準答案逐欄比對（新版邏輯）
+
     Args:
         buyer_tax_id:        OCR 辨識到的買方統編
         seller_tax_id:       OCR 辨識到的賣方統編
+        buyer_company_name:  OCR 辨識到的買方公司名稱
+        seller_company_name: OCR 辨識到的賣方公司名稱
         amount_validation:   金額檢核結果 dict
         extracted_invoice_no: OCR 辨識到的發票號碼
         standard:            Excel 標準答案 dict（單筆）
+        llm_fields:          LLM 擷取的欄位結果
+        active_rules:        本張發票適用的檢核項目清單
+        active_detail_fields: 明細項目要比對的欄位清單
+        tax_type:            稅別字串（"應稅" / "零稅率" / "免稅" / None）
+        tax_found:           發票上是否有勾選其中一項（True=已勾選，False=找不到）
+        std_sales_amount:    標準答案未稅金額（由明細加總計算）
+        std_tax_amount:      標準答案稅額（由稅別計算）
+        std_total_amount:    標準答案合計金額（未稅+稅額）
     Returns:
         dict: 各欄位比對結果
     """
@@ -427,16 +510,21 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
 
     # ✅ 每個比對項目前先確認是否在 active_rules 內
     if "發票號碼" in active_rules:
-        # --- 0. 發票號碼比對 ---
-        std_invoice_no = standard.get("發票號碼", "").strip()
+        # --- 0. 發票號碼：比對 Excel 標準答案 ---
+        # std_invoice_no = standard.get("發票號碼", "").strip()
+        # compare["發票號碼"] = {
+        #     "標準答案": std_invoice_no,
+        #     "OCR結果":  extracted_invoice_no or "",
+        #     "是否一致": (extracted_invoice_no == std_invoice_no)
+        # }
         compare["發票號碼"] = {
-            "標準答案": std_invoice_no,
-            "OCR結果":  extracted_invoice_no or "",
-            "是否一致": (extracted_invoice_no == std_invoice_no)
-        }
+        "OCR結果":  extracted_invoice_no or "",
+        "說明":     "只要有值即通過",
+        "是否一致": bool(extracted_invoice_no)
+    }
 
     if "買方統編" in active_rules:
-        # --- 1. 買方統編：OCR 結果與固定值 05637971 比對 ---
+        # --- 1. 買方統編：與固定值 05637971 比對 ---
         compare["買方統編"] = {
             "標準答案": BUYER_TAX_ID_FIXED,
             "OCR結果":  buyer_tax_id or "",
@@ -444,7 +532,7 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
         }
 
     if "買方公司名稱" in active_rules:
-        # --- 2. 買方公司名稱：OCR 結果與固定值比對 ---
+        # --- 2. 買方公司名稱：與固定值比對 ---
         is_match, match_method = is_company_name_match(buyer_company_name, BUYER_COMPANY_NAME_FIXED)
         compare["買方公司名稱"] = {
             "標準答案": BUYER_COMPANY_NAME_FIXED,
@@ -452,58 +540,40 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
             "比對方式": match_method,
             "是否一致": is_match
         }
-    # compare["買方公司名稱"] = {
-    #     "標準答案": BUYER_COMPANY_NAME_FIXED,
-    #     "OCR結果":  buyer_company_name or "",
-    #     "是否一致": (buyer_company_name == BUYER_COMPANY_NAME_FIXED)
-    # }
 
     if "賣方統編" in active_rules:
-        # --- 3. 賣方統編：OCR 結果與 Excel 廠商統編比對 ---
-        std_seller_tax_id = standard.get("廠商統編", "").strip()
+        # --- 3. 賣方統編：只要 OCR 有值就通過（不比對 Excel）---
+        ocr_seller_tax = (seller_tax_id or "").strip()
         compare["賣方統編"] = {
-            "標準答案": std_seller_tax_id,
-            "OCR結果":  seller_tax_id or "",
-            "是否一致": (seller_tax_id == std_seller_tax_id)
+            "標準答案": "（有值即通過）",
+            "OCR結果":  ocr_seller_tax,
+            "是否一致": bool(ocr_seller_tax)
         }
 
     if "賣方公司名稱" in active_rules:
-        # --- 4. 賣方公司名稱比對 ---
-        std_seller_name = standard.get("廠商名稱", "").strip()
-        is_seller_match, seller_match_method = is_company_name_match(seller_company_name, std_seller_name)
+        # --- 4. 賣方公司名稱：只要 OCR 有值就通過（不比對 Excel）---
+        ocr_seller_name = (seller_company_name or "").strip()
         compare["賣方公司名稱"] = {
-            "標準答案": std_seller_name,
-            "OCR結果":  seller_company_name or "",
-            "比對方式": seller_match_method,
-            "是否一致": is_seller_match
+            "標準答案": "（有值即通過）",
+            "OCR結果":  ocr_seller_name,
+            "是否一致": bool(ocr_seller_name)
         }
 
-    # # --- 5. 未稅金額比對 ---
-    # std_sales = standard.get("未稅金額", "").replace(",", "").strip()
-    # ocr_sales = str(amount_validation.get("sales_amount") or "")
-    # compare["未稅金額"] = {
-    #     "標準答案": std_sales,
-    #     "OCR結果":  ocr_sales,
-    #     "是否一致": ocr_sales == std_sales
-    # }
-
-    # # --- 6. 稅額比對 ---
-    # std_tax = standard.get("稅額", "").replace(",", "").strip()
-    # ocr_tax = str(amount_validation.get("tax_amount") or "")
-    # compare["稅額"] = {
-    #     "標準答案": std_tax,
-    #     "OCR結果":  ocr_tax,
-    #     "是否一致": ocr_tax == std_tax
-    # }
-
-    # # --- 7. 合計金額比對 ---
-    # std_total = standard.get("合計金額", "").replace(",", "").strip()
-    # ocr_total = str(amount_validation.get("total_amount") or "")
-    # compare["合計金額"] = {
-    #     "標準答案": std_total,
-    #     "OCR結果":  ocr_total,
-    #     "是否一致": ocr_total == std_total
-    # }
+    # --- ✅ 營業稅稅別判斷：有勾選其中一項才通過 ---
+    if "營業稅稅別判斷" in active_rules:
+        if tax_found and tax_type is not None:
+            compare["營業稅稅別判斷"] = {
+                "結果":   tax_type,
+                "說明":   f"發票上勾選項目為「{tax_type}」",
+                "是否一致": True
+            }
+        else:
+            # 找不到勾選：輸出失敗
+            compare["營業稅稅別判斷"] = {
+                "結果":   "未找到勾選",
+                "說明":   "發票上找不到應稅/零稅率/免稅的勾選",
+                "是否一致": False
+            }
 
     # --- ✅ LLM 欄位比對 ---
     if llm_fields:
@@ -517,58 +587,89 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
                 "是否一致": ocr_period == std_period
             }
 
+        if "未稅金額" in active_rules:
+            # --- 5. 未稅金額：標準答案=明細金額加總，OCR結果維持原邏輯 ---
+            ocr_sales = (llm_fields.get("未稅金額") or "").replace(",", "").strip()
+            std_sales_str = str(std_sales_amount) if std_sales_amount is not None else ""
+            # 比對時去除小數點後多餘的零
+            try:
+                ocr_sales_num = int(float(ocr_sales)) if ocr_sales else None
+                std_sales_num = int(std_sales_amount) if std_sales_amount is not None else None
+                is_sales_match = (ocr_sales_num == std_sales_num) if (ocr_sales_num is not None and std_sales_num is not None) else False
+            except (ValueError, TypeError):
+                is_sales_match = (ocr_sales == std_sales_str)
+            compare["未稅金額"] = {
+                "標準答案": std_sales_str,
+                "OCR結果":  ocr_sales,
+                "說明":     "標準答案為明細金額加總",
+                "是否一致": is_sales_match
+            }
+
+        if "稅額" in active_rules:
+            # --- 6. 稅額：標準答案依稅別計算，OCR結果維持原邏輯 ---
+            ocr_tax = (llm_fields.get("稅額") or "").replace(",", "").strip()
+            std_tax_str = str(std_tax_amount) if std_tax_amount is not None else ""
+            try:
+                ocr_tax_num = int(float(ocr_tax)) if ocr_tax else None
+                std_tax_num = int(std_tax_amount) if std_tax_amount is not None else None
+                is_tax_match = (ocr_tax_num == std_tax_num) if (ocr_tax_num is not None and std_tax_num is not None) else False
+            except (ValueError, TypeError):
+                is_tax_match = (ocr_tax == std_tax_str)
+            tax_note = "應稅（未稅金額×5%）" if tax_type == "應稅" else "免稅（固定為0）"
+            compare["稅額"] = {
+                "標準答案": std_tax_str,
+                "OCR結果":  ocr_tax,
+                "說明":     f"標準答案依{tax_note}計算",
+                "是否一致": is_tax_match
+            }
+
+        if "合計金額" in active_rules:
+            # --- 7. 合計金額：標準答案=未稅+稅額，OCR結果維持原邏輯 ---
+            ocr_total = (llm_fields.get("合計金額") or "").replace(",", "").strip()
+            std_total_str = str(std_total_amount) if std_total_amount is not None else ""
+            try:
+                ocr_total_num = int(float(ocr_total)) if ocr_total else None
+                std_total_num = int(std_total_amount) if std_total_amount is not None else None
+                is_total_match = (ocr_total_num == std_total_num) if (ocr_total_num is not None and std_total_num is not None) else False
+            except (ValueError, TypeError):
+                is_total_match = (ocr_total == std_total_str)
+            compare["合計金額"] = {
+                "標準答案": std_total_str,
+                "OCR結果":  ocr_total,
+                "說明":     "標準答案為未稅金額+稅額",
+                "是否一致": is_total_match
+            }
+
         if "金額大寫中文" in active_rules:
-            # 金額大寫中文
-            std_chinese = standard.get("金額大寫中文", "").strip()
+            # --- 8. 金額大寫中文：根據合計金額與 OCR 中文大寫比對意思是否相符 ---
             ocr_chinese = (llm_fields.get("金額大寫中文") or "").strip()
-            is_chinese_match, chinese_match_method = is_chinese_amount_match(ocr_chinese, std_chinese)
+            # 使用 LLM 判斷 OCR 中文大寫是否與合計金額數字相符
+            is_chinese_match, chinese_match_method = compare_chinese_amount_meaning_by_llm(
+                ocr_chinese, std_total_amount
+            )
             compare["金額大寫中文"] = {
-                "標準答案": std_chinese,
+                "標準答案": f"合計金額 {std_total_amount} 的中文大寫",
                 "OCR結果":  ocr_chinese,
                 "比對方式": chinese_match_method,
                 "是否一致": is_chinese_match
             }
 
-        if "未稅金額" in active_rules:
-            # 未稅金額
-            std_sales = standard.get("未稅金額", "").replace(",", "").strip()
-            ocr_sales = (llm_fields.get("未稅金額") or "").replace(",", "").strip()
-            compare["未稅金額"] = {
-                "標準答案": std_sales,
-                "OCR結果":  ocr_sales,
-                "是否一致": ocr_sales == std_sales
-            }
-
-
-        if "稅額" in active_rules:
-            # 稅額
-            std_tax = standard.get("稅額", "").replace(",", "").strip()
-            ocr_tax = (llm_fields.get("稅額") or "").replace(",", "").strip()
-            compare["稅額"] = {
-                "標準答案": std_tax,
-                "OCR結果":  ocr_tax,
-            "是否一致": ocr_tax == std_tax
-        }
-
-        if "合計金額" in active_rules:
-            # 合計金額
-            std_total = standard.get("合計金額", "").replace(",", "").strip()
-            ocr_total = (llm_fields.get("合計金額") or "").replace(",", "").strip()
-            compare["合計金額"] = {
-                "標準答案": std_total,
-                "OCR結果":  ocr_total,
-                "是否一致": ocr_total == std_total
-            }
-
         if "明細項目" in active_rules:
-            std_items = standard.get("明細項目", [])
+            # --- 9. 明細項目：只要每筆的各欄位有值就通過 ---
             ocr_items = llm_fields.get("明細項目", [])
-            compare["明細項目"] = compare_detail_items(
-                ocr_items, std_items,
-                active_detail_fields=active_detail_fields   # ✅ 傳入
+            compare["明細項目"] = compare_detail_items_has_value(
+                ocr_items,
+                active_detail_fields=active_detail_fields
             )
 
-    # --- 8. 整體通過判斷：所有欄位都一致才算通過 ---
+    # ✅ 發票日期加入 compare_result
+    compare["發票日期"] = {
+        "OCR結果":  invoice_date or "未找到",
+        "說明":     "只要有值即通過",
+        "是否一致": bool(invoice_date)
+    }
+
+    # --- 整體通過判斷：所有欄位都一致才算通過 ---
     compare["全部比對通過"] = all(
         v["是否一致"] for v in compare.values() if isinstance(v, dict)
     )
@@ -1679,6 +1780,10 @@ for i, page in enumerate(pages):
     print(f"\n===== 第 {i+1} 頁 LLM 欄位擷取 =====")
     ocr_text_with_position = build_ocr_text_with_position(ocr_items)
     llm_fields = extract_invoice_fields_by_llm(ocr_text_with_position)
+    # ✅ 發票日期：從 llm_fields 取出（LLM 已一併擷取）
+    invoice_date = llm_fields.get("發票日期")
+
+    print(f"  發票日期:    {invoice_date}")
     print(f"  年度期間:    {llm_fields.get('年度期間')}")
     print(f"  金額大寫中文: {llm_fields.get('金額大寫中文')}")
     print(f"  未稅金額:    {llm_fields.get('未稅金額')}")
@@ -1699,19 +1804,314 @@ for i, page in enumerate(pages):
     if standard is None:
         print(f"⚠️  找不到發票號碼 [{lookup_invoice_no}] 的標準答案")
 
+    # ✅ 定義哪些欄位屬於 OCR+Regex、哪些屬於 LLM
+    # 「營業稅稅別判斷」也納入 VLM 重試欄位
+    OCR_REGEX_FIELDS = ["發票號碼", "買方統編", "賣方統編", "買方公司名稱", "賣方公司名稱"]
+    LLM_FIELDS       = ["年度期間", "發票日期", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目"]
+    TAX_FIELDS       = ["營業稅稅別判斷"]   # 稅別判斷獨立處理
+    ALL_RETRY_FIELDS = OCR_REGEX_FIELDS + LLM_FIELDS + TAX_FIELDS
+
+    def get_failed_fields(compare_result: dict, target_fields: list) -> list:
+        """找出比對失敗且在 target_fields 內的欄位"""
+        failed = []
+        for k, v in compare_result.items():
+            if k not in target_fields:
+                continue
+            if isinstance(v, dict) and v.get("是否一致") == False:
+                failed.append(k)
+        return failed
+
+    # ---------------------------------
+    # ✅ 3.7 營業稅稅別判斷（應稅/零稅率/免稅）
+    # ---------------------------------
+    print(f"\n===== 第 {i+1} 頁 營業稅稅別判斷 =====")
+    tax_result = determine_tax_type_by_llm(ocr_text_with_position)
+    tax_type   = tax_result.get("稅別")       # "應稅" / "零稅率" / "免稅" / None
+    tax_found  = tax_result.get("已勾選", False)
+    print(f"  稅別: {tax_type}，已勾選: {tax_found}，依據: {tax_result.get('判斷依據')}")
+
+    # ---------------------------------
+    # ✅ 3.8 計算標準答案（未稅金額/稅額/合計金額）
+    # ---------------------------------
+    # 未稅金額標準答案：由 LLM 彙整後的明細金額加總計算
+    std_sales_amount = None
+    ocr_detail_items = llm_fields.get("明細項目", [])
+    if ocr_detail_items:
+        total_from_detail = 0
+        valid_sum = True
+        for detail_item in ocr_detail_items:
+            amt_str = str(detail_item.get("金額") or "").replace(",", "").strip()
+            try:
+                total_from_detail += int(float(amt_str)) if amt_str else 0
+            except (ValueError, TypeError):
+                valid_sum = False
+                break
+        if valid_sum:
+            std_sales_amount = total_from_detail
+            print(f"  未稅金額標準答案（明細加總）: {std_sales_amount}")
+        else:
+            print(f"  ⚠️  明細金額含無法解析的值，無法計算標準答案")
+    else:
+        print(f"  ⚠️  無明細項目，無法計算未稅金額標準答案")
+
+    # 稅額標準答案：對應稅別判斷
+    # 應稅 → 未稅金額 × 5%；零稅率 / 免稅 → 0
+    std_tax_amount = None
+    if std_sales_amount is not None and tax_type is not None:
+        if tax_type == "應稅":
+            std_tax_amount = round(std_sales_amount * 0.05)
+        else:
+            std_tax_amount = 0
+        print(f"  稅額標準答案（{tax_type}）: {std_tax_amount}")
+
+    # 合計金額標準答案：未稅金額 + 稅額
+    std_total_amount = None
+    if std_sales_amount is not None and std_tax_amount is not None:
+        std_total_amount = std_sales_amount + std_tax_amount
+        print(f"  合計金額標準答案：{std_total_amount}")
+    # ✅ 第一次比對
     compare_result = compare_with_standard(
-        buyer_tax_id,
-        seller_tax_id,
-        buyer_company_name,
-        seller_company_name,
-        amount_validation,
-        extracted_invoice_no,
-        standard,
-        llm_fields,
-        active_rules=prefix_rule["rules"],   # ✅ 傳入檢核項目清單
-        active_detail_fields=prefix_rule["detail_fields"]   # ✅ 新增
+        buyer_tax_id, seller_tax_id,
+        buyer_company_name, seller_company_name,
+        amount_validation, extracted_invoice_no,
+        standard, llm_fields,
+        active_rules=prefix_rule["rules"],
+        active_detail_fields=prefix_rule["detail_fields"],
+        tax_type=tax_type,
+        tax_found=tax_found,
+        std_sales_amount=std_sales_amount,
+        std_tax_amount=std_tax_amount,
+        std_total_amount=std_total_amount
     )
+
+    # ✅ LLM 重試（OCR+Regex 和 LLM 欄位都納入）
+    MAX_FIELD_RETRY = 2
+    for retry_attempt in range(MAX_FIELD_RETRY):
+
+        failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+        if not failed_fields:
+            print(f"✅ 所有欄位比對通過，不需重試")
+            break
+
+        print(f"\n[LLM重試] 第{retry_attempt+1}次，失敗欄位：{failed_fields}")
+
+        # ✅ 「營業稅稅別判斷」失敗：重新呼叫 determine_tax_type_by_llm 重試
+        if "營業稅稅別判斷" in failed_fields:
+            print(f"[LLM重試] 重新判斷稅別...")
+            tax_retry_result = determine_tax_type_by_llm(ocr_text_with_position)
+            tax_type  = tax_retry_result.get("稅別")
+            tax_found = tax_retry_result.get("已勾選", False)
+            print(f"[LLM重試] 稅別重試結果：{tax_type}，已勾選={tax_found}")
+            # 重新計算稅額/合計的標準答案
+            if std_sales_amount is not None and tax_type is not None:
+                std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
+                std_total_amount = std_sales_amount + std_tax_amount
+                print(f"[LLM重試] 重新計算標準答案: 稅額={std_tax_amount}, 合計={std_total_amount}")
+            # 從失敗欄位清單中排除，其餘欄位繼續走一般 LLM 重試流程
+            other_failed_fields = [f for f in failed_fields if f != "營業稅稅別判斷"]
+        else:
+            other_failed_fields = failed_fields
+
+        if other_failed_fields:
+            retry_result = reextract_specific_fields(ocr_text_with_position, other_failed_fields)
+            if not retry_result:
+                print(f"⚠️  [LLM重試] 回傳空值，放棄重試")
+                # 更新比對後直接 break
+            else:
+                # ✅ 更新對應來源的變數
+                for field in other_failed_fields:
+                    val = retry_result.get(field)
+                    if val is None:
+                        continue
+                    print(f"[LLM重試] 更新欄位 [{field}]: → {val}")
+
+                    if field == "發票號碼":
+                        extracted_invoice_no = val
+                    elif field == "買方統編":
+                        buyer_tax_id = val
+                    elif field == "賣方統編":
+                        seller_tax_id = val
+                    elif field == "買方公司名稱":
+                        buyer_company_name = val
+                    elif field == "賣方公司名稱":
+                        seller_company_name = val
+                    elif field == "發票日期":
+                        invoice_date = val
+                        print(f"[VLM保底] 發票日期更新：{invoice_date}")
+                    else:
+                        llm_fields[field] = val
+
+        # 重新計算未稅/稅額/合計金額標準答案（如果明細金額更新了）
+        if "明細項目" in failed_fields:
+            updated_detail_items = llm_fields.get("明細項目", [])
+            if updated_detail_items:
+                total_from_detail = 0
+                valid_sum = True
+                for detail_item in updated_detail_items:
+                    amt_str = str(detail_item.get("金額") or "").replace(",", "").strip()
+                    try:
+                        total_from_detail += int(float(amt_str)) if amt_str else 0
+                    except (ValueError, TypeError):
+                        valid_sum = False
+                        break
+                if valid_sum:
+                    std_sales_amount = total_from_detail
+                    std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
+                    std_total_amount = std_sales_amount + std_tax_amount
+                    print(f"[LLM重試] 重新計算標準答案: 未稅={std_sales_amount}, 稅額={std_tax_amount}, 合計={std_total_amount}")
+
+        # 重新比對
+        compare_result = compare_with_standard(
+            buyer_tax_id, seller_tax_id,
+            buyer_company_name, seller_company_name,
+            amount_validation, extracted_invoice_no,
+            standard, llm_fields,
+            active_rules=prefix_rule["rules"],
+            active_detail_fields=prefix_rule["detail_fields"],
+            tax_type=tax_type,
+            tax_found=tax_found,
+            std_sales_amount=std_sales_amount,
+            std_tax_amount=std_tax_amount,
+            std_total_amount=std_total_amount
+        )
+
+        still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+        if still_failed:
+            print(f"[LLM重試] 第{retry_attempt+1}次後仍失敗：{still_failed}")
+        else:
+            print(f"[LLM重試] 第{retry_attempt+1}次後全部通過 ✅")
+            break
+
+    # ✅ VLM 保底（LLM 重試後仍失敗）
+    VLM_MAX_RETRY        = 2
+    final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+    if final_failed_fields:
+        print(f"\n[VLM保底] LLM重試{MAX_FIELD_RETRY}次仍失敗：{final_failed_fields}")
+        print(f"[VLM保底] 改用 VLM 圖片理解，最多重試 {VLM_MAX_RETRY} 次...")
+
+        vlm_current_fields = list(final_failed_fields)
+
+        for vlm_attempt in range(1, VLM_MAX_RETRY + 1):
+            print(f"\n[VLM保底] 第{vlm_attempt}次，擷取欄位：{vlm_current_fields}")
+
+            # ✅ 第2次起：先讓 LLM 定位失敗欄位區域，裁切後再給 VLM
+            if vlm_attempt >= 2:
+                print(f"[VLM保底] 嘗試 LLM 區域定位裁切...")
+                bbox_result = locate_field_region_by_llm(ocr_text_with_position, vlm_current_fields)
+
+                if bbox_result and all(k in bbox_result for k in ["x1", "y1", "x2", "y2"]):
+                    print(f"[VLM保底] LLM 定位結果：{bbox_result}（reason: {bbox_result.get('reason', '')}）")
+
+                    cropped = crop_image_region(
+                        page,
+                        [bbox_result["x1"], bbox_result["y1"], bbox_result["x2"], bbox_result["y2"]],
+                        padding=0
+                    )
+                    vlm_input_image = cropped
+
+                    # ✅ 儲存裁切圖片供 debug 確認
+                    os.makedirs("vlm_crop_debug", exist_ok=True)
+                    crop_save_path = f"vlm_crop_debug/page{i+1}_attempt{vlm_attempt}_{'_'.join(vlm_current_fields)}.png"
+                    cropped.save(crop_save_path)
+                    print(f"[VLM保底] 裁切圖片已儲存：{crop_save_path}，尺寸：{cropped.size}")
+
+                else:
+                    print(f"[VLM保底] LLM 定位失敗，改用整張圖")
+                    vlm_input_image = page
+            else:
+                # 第1次：整張圖
+                vlm_input_image = page
+
+            vlm_result = extract_fields_from_image_region(vlm_input_image, vlm_current_fields)
+
+            if not vlm_result:
+                print(f"⚠️  [VLM保底] 第{vlm_attempt}次回傳空值")
+                if vlm_attempt == VLM_MAX_RETRY:
+                    validation_result["需人工審核欄位"] = vlm_current_fields
+                continue
+
+            # ✅ 更新對應欄位變數
+            for field in vlm_current_fields:
+                val = vlm_result.get(field)
+                if val is None:
+                    continue
+                print(f"[VLM保底] 第{vlm_attempt}次 更新欄位 [{field}]: → {val}")
+
+                if field == "發票號碼":
+                    extracted_invoice_no = val
+                elif field == "買方統編":
+                    buyer_tax_id = val
+                elif field == "賣方統編":
+                    seller_tax_id = val
+                elif field == "買方公司名稱":
+                    buyer_company_name = val
+                elif field == "賣方公司名稱":
+                    seller_company_name = val
+                elif field == "營業稅稅別判斷":
+                    # ✅ VLM 回傳的稅別字串（"應稅"/"零稅率"/"免稅"/null）解析為 tax_type/tax_found
+                    VALID_TAX_TYPES = ["應稅", "零稅率", "免稅"]
+                    vlm_tax = str(val).strip() if val else None
+                    if vlm_tax in VALID_TAX_TYPES:
+                        tax_type  = vlm_tax
+                        tax_found = True
+                        print(f"[VLM保底] 稅別更新：{tax_type}（已勾選）")
+                        # 重新計算稅額/合計標準答案
+                        if std_sales_amount is not None:
+                            std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
+                            std_total_amount = std_sales_amount + std_tax_amount
+                            print(f"[VLM保底] 重新計算標準答案: 稅額={std_tax_amount}, 合計={std_total_amount}")
+                    else:
+                        tax_type  = None
+                        tax_found = False
+                        print(f"[VLM保底] 稅別仍未找到（回傳：{val}）")
+                elif field == "發票日期":
+                    invoice_date = val
+                    print(f"[LLM重試] 發票日期更新：{invoice_date}")
+                else:
+                    llm_fields[field] = val
+
+            # ✅ 重新比對，確認內容是否正確
+            compare_result = compare_with_standard(
+                buyer_tax_id, seller_tax_id,
+                buyer_company_name, seller_company_name,
+                amount_validation, extracted_invoice_no,
+                standard, llm_fields,
+                active_rules=prefix_rule["rules"],
+                active_detail_fields=prefix_rule["detail_fields"],
+                tax_type=tax_type,
+                tax_found=tax_found,
+                std_sales_amount=std_sales_amount,
+                std_tax_amount=std_tax_amount,
+                std_total_amount=std_total_amount
+            )
+
+            vlm_still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+
+            if not vlm_still_failed:
+                print(f"[VLM保底] 第{vlm_attempt}次比對通過 ✅")
+                break
+
+            print(f"[VLM保底] 第{vlm_attempt}次比對後仍失敗：{vlm_still_failed}")
+
+            if vlm_attempt == VLM_MAX_RETRY:
+                print(f"[VLM保底] 已達最大重試次數（{VLM_MAX_RETRY}次），轉人工審核")
+                validation_result["需人工審核欄位"] = vlm_still_failed
+            else:
+                # ✅ 下一輪只針對仍失敗的欄位
+                vlm_current_fields = vlm_still_failed
+                print(f"[VLM保底] 下一次只針對失敗欄位重試：{vlm_current_fields}")
+
+    # ✅ 發票日期加入 compare_result
+    compare_result["發票日期"] = {
+        "OCR結果":  invoice_date or "未找到",
+        "說明":     "只要有值即通過",
+        "是否一致": bool(invoice_date)
+    }
+
     validation_result["與Excel比對結果"] = compare_result
+
+    # ✅ 發票日期單獨記錄（只要有值就好，不需比對標準答案）
+    validation_result["發票日期"] = invoice_date or "未找到"
 
     # ---------------------------------
     # 5. 顯示結果
