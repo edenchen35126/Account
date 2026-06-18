@@ -12,12 +12,14 @@ from io import BytesIO
 # VLM 設定
 # =========================
 VLLM_LLM_MODEL2 = "gemma-4-26B-A4B-it"
-VLLM_LLM_API_BASE2 = "http://10.2.5.111:8015/gemma-4-26B-A4B-it/v1"
+# VLLM_LLM_API_BASE2 = "http://10.2.5.111:8015/gemma-4-26B-A4B-it/v1"
+VLLM_LLM_API_BASE2 = "http://10.2.5.22:8190/v1"
 
 POPPLER_PATH      = "Release-25.12.0-0/poppler-25.12.0/Library/bin"
 
 client = OpenAI(
-    api_key="sk-abc123DEF456ghi789JKL012mno345PQR678stu901VWX234yz",        # 本地部署不需要真實 key
+    # api_key="sk-abc123DEF456ghi789JKL012mno345PQR678stu901VWX234yz",        # 本地部署不需要真實 key
+    api_key="sk-Wz-SOJu0vl6_0HHlVuaRXQ",
     base_url=VLLM_LLM_API_BASE2
 )
 

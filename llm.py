@@ -7,8 +7,10 @@ from openai import OpenAI
 # =========================
 
 VLLM_LLM_MODEL = "gemma-4-26B-A4B-it"
-VLLM_LLM_API_BASE = "http://10.2.5.111:8015/gemma-4-26B-A4B-it/v1"
-VLLM_API_KEY      = "sk-abc123DEF456ghi789JKL012mno345PQR678stu901VWX234yz"
+VLLM_LLM_API_BASE = "http://10.2.5.22:8190/v1"
+
+
+VLLM_API_KEY      = "sk-Wz-SOJu0vl6_0HHlVuaRXQ"
 
 client = OpenAI(
     api_key=VLLM_API_KEY,
@@ -573,6 +575,57 @@ def compare_chinese_amount_meaning_by_llm(ocr_chinese: str, total_amount) -> tup
         std_int   = int(float(str(total_amount).replace(",", "")))
         print(f"[中文金額比對] 程式碼轉換：OCR={ocr_chinese!r} → {converted}，標準答案={std_int}")
 
+        def build_repair_candidates(raw: str, target: int) -> list[str]:
+            """
+            針對手寫發票「中文大寫定位格」常見噪音建立修復候選。
+            典型問題：固定單位字被 OCR 合進內容，造成數值被放大（如 10607200）。
+            """
+            base = re.sub(r'\s+', '', str(raw))
+            base = re.sub(r'^新臺幣', '', base)
+            base = re.sub(r'元整$|元$', '元', base)
+
+            candidates = [base]
+
+            # 常見誤植前綴（定位格左側空白常被誤判成「壹仟」等）
+            for prefix in ["壹仟", "一千", "壹千", "壹佰", "一百"]:
+                if base.startswith(prefix):
+                    candidates.append(base[len(prefix):])
+
+            # 小金額常見誤植：把「X萬」誤成「X拾萬 / X佰萬 / X仟萬」
+            if target < 100_000:
+                candidates.append(re.sub(r'([壹貳參肆伍陸柒捌玖一二三四五六七八九])拾萬', r'\1萬', base))
+                candidates.append(re.sub(r'([壹貳參肆伍陸柒捌玖一二三四五六七八九])佰萬', r'\1萬', base))
+                candidates.append(re.sub(r'([壹貳參肆伍陸柒捌玖一二三四五六七八九])仟萬', r'\1萬', base))
+
+                # 若「萬」前面混入多餘單位，取萬前最後一個數字字元（例：壹仟陸拾萬 -> 陸萬）
+                if '萬' in base:
+                    pre, post = base.split('萬', 1)
+                    numerals = re.findall(r'[壹貳參肆伍陸柒捌玖一二三四五六七八九零]', pre)
+                    if numerals:
+                        candidates.append(f"{numerals[-1]}萬{post}")
+
+            # 去重且維持順序
+            dedup = []
+            seen = set()
+            for c in candidates:
+                if not c or c in seen:
+                    continue
+                seen.add(c)
+                dedup.append(c)
+            return dedup
+
+        def try_repaired_match(raw: str, target: int):
+            for cand in build_repair_candidates(raw, target):
+                val = chinese_amount_to_int(cand)
+                print(f"[中文金額比對][修復候選] {cand!r} -> {val}")
+                if val is None:
+                    continue
+                if val == target:
+                    return True, cand, val
+                if abs(val - target) / max(target, 1) < 0.01:
+                    return True, cand, val
+            return False, None, None
+
         if converted is not None:
             if converted == std_int:
                 return True, f"程式碼轉換相符（{converted:,}）"
@@ -580,6 +633,10 @@ def compare_chinese_amount_meaning_by_llm(ocr_chinese: str, total_amount) -> tup
             # 差距在 1% 以內視為四捨五入誤差（如稅額進位）
             if abs(converted - std_int) / max(std_int, 1) < 0.01:
                 return True, f"程式碼轉換近似相符（{converted:,} ≈ {std_int:,}）"
+
+            repaired_ok, repaired_text, repaired_val = try_repaired_match(ocr_chinese, std_int)
+            if repaired_ok:
+                return True, f"OCR噪音修正後相符（{repaired_text} -> {repaired_val:,}）"
 
             # 差距明確，直接判不符，不需再問 LLM
             return False, f"中文大寫金額為 {converted:,} 元，與數字金額 {std_int:,} 元不符。"
