@@ -502,9 +502,9 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
     Returns:
         dict: 各欄位比對結果
     """
-    # 找不到對應標準答案時，直接回傳錯誤訊息
-    if standard is None:
-        return {"比對結果": f"找不到發票號碼 [{extracted_invoice_no}] 對應的標準答案"}
+    # # 找不到對應標準答案時，直接回傳錯誤訊息
+    # if standard is None:
+    #     return {"比對結果": f"找不到發票號碼 [{extracted_invoice_no}] 對應的標準答案"}
 
     compare = {}
 
@@ -661,13 +661,13 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
                 ocr_items,
                 active_detail_fields=active_detail_fields
             )
-
-    # ✅ 發票日期加入 compare_result
-    compare["發票日期"] = {
-        "OCR結果":  invoice_date or "未找到",
-        "說明":     "只要有值即通過",
-        "是否一致": bool(invoice_date)
-    }
+    if "發票日期" in active_rules:
+        # ✅ 發票日期加入 compare_result
+        compare["發票日期"] = {
+            "OCR結果":  invoice_date or "未找到",
+            "說明":     "只要有值即通過",
+            "是否一致": bool(invoice_date)
+        }
 
     # --- 整體通過判斷：所有欄位都一致才算通過 ---
     compare["全部比對通過"] = all(
@@ -1751,17 +1751,56 @@ for i, page in enumerate(pages):
     # ---------------------------------
     extracted_invoice_no = extracted_data.get("發票號碼")
     lookup_invoice_no    = extracted_invoice_no
+    ocr_text_with_position = build_ocr_text_with_position(ocr_items)
+
+    def clean_invoice_no_candidate(value):
+        """清理 LLM/VLM 回傳的發票號碼候選值"""
+        if value is None:
+            return None
+        cleaned = re.sub(r'[^A-Za-z0-9]', '', str(value)).upper()
+        if cleaned in ["", "NULL", "NONE", "未找到"]:
+            return None
+        return cleaned if re.fullmatch(r'[A-Z]{2}\d{6,8}', cleaned) else None
 
     # ✅ 依發票前兩碼決定檢核規則
     prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no)
     print(f"\n  發票前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
 
+    # ✅ 發票前綴找不到/未設定時：先用 LLM 補抓發票號碼，再用 VLM 保底
+    if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
+        print(f"⚠️  發票前綴無法使用，先改用 LLM 重新擷取發票號碼")
+        llm_invoice_retry = reextract_specific_fields(ocr_text_with_position, ["發票號碼"])
+        llm_invoice_no = clean_invoice_no_candidate(llm_invoice_retry.get("發票號碼") if llm_invoice_retry else None)
+
+        if llm_invoice_no:
+            extracted_invoice_no = llm_invoice_no
+            lookup_invoice_no    = llm_invoice_no
+            extracted_data["發票號碼"] = llm_invoice_no
+            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no)
+            print(f"[前綴補救][LLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
+        else:
+            print(f"⚠️  [前綴補救][LLM] 仍無法取得可用發票號碼")
+
+    if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
+        print(f"⚠️  發票前綴仍無法使用，改用 VLM 圖片理解重新擷取發票號碼")
+        vlm_invoice_retry = extract_fields_from_image_region(page, ["發票號碼"])
+        vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
+
+        if vlm_invoice_no:
+            extracted_invoice_no = vlm_invoice_no
+            lookup_invoice_no    = vlm_invoice_no
+            extracted_data["發票號碼"] = vlm_invoice_no
+            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no)
+            print(f"[前綴補救][VLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
+        else:
+            print(f"⚠️  [前綴補救][VLM] 仍無法取得可用發票號碼")
+
     if prefix_rule["prefix"] is None:
-        print(f"⚠️  無法取得發票前綴，跳過此頁")
+        print(f"⚠️  LLM/VLM 補救後仍無法取得發票前綴，跳過此頁")
         all_pages_result.append({
             "page":   i + 1,
             "status": "skipped",
-            "reason": "無法取得發票號碼前綴"
+            "reason": "LLM/VLM補救後仍無法取得發票號碼前綴"
         })
         continue
 
@@ -1770,7 +1809,7 @@ for i, page in enumerate(pages):
         all_pages_result.append({
             "page":   i + 1,
             "status": "manual_review",
-            "reason": f"發票前綴 [{prefix_rule['prefix']}] 無對應檢核規則"
+            "reason": f"LLM/VLM補救後發票前綴 [{prefix_rule['prefix']}] 仍無對應檢核規則"
         })
         continue
 
@@ -1778,7 +1817,7 @@ for i, page in enumerate(pages):
     # ✅ 3.6 LLM 彙整欄位
     # ---------------------------------
     print(f"\n===== 第 {i+1} 頁 LLM 欄位擷取 =====")
-    ocr_text_with_position = build_ocr_text_with_position(ocr_items)
+    # ocr_text_with_position = build_ocr_text_with_position(ocr_items)
     llm_fields = extract_invoice_fields_by_llm(ocr_text_with_position)
     # ✅ 發票日期：從 llm_fields 取出（LLM 已一併擷取）
     invoice_date = llm_fields.get("發票日期")
@@ -1825,9 +1864,30 @@ for i, page in enumerate(pages):
     # ✅ 3.7 營業稅稅別判斷（應稅/零稅率/免稅）
     # ---------------------------------
     print(f"\n===== 第 {i+1} 頁 營業稅稅別判斷 =====")
-    tax_result = determine_tax_type_by_llm(ocr_text_with_position)
-    tax_type   = tax_result.get("稅別")       # "應稅" / "零稅率" / "免稅" / None
-    tax_found  = tax_result.get("已勾選", False)
+    VALID_TAX_TYPES = ["應稅", "零稅率", "免稅"]
+    tax_type = None
+    tax_found = False
+    tax_result = {"稅別": None, "已勾選": False, "判斷依據": "尚未判斷"}
+
+    print("[VLM稅別判斷] 使用整張圖片，只判斷營業稅稅別...")
+    vlm_tax_result = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
+    vlm_tax = str(vlm_tax_result.get("營業稅稅別判斷") or "").strip() if vlm_tax_result else ""
+
+    if vlm_tax in VALID_TAX_TYPES:
+        tax_type = vlm_tax
+        tax_found = True
+        tax_result = {
+            "稅別": tax_type,
+            "已勾選": True,
+            "判斷依據": "VLM整張圖片直接判斷營業稅稅別"
+        }
+        print(f"  [VLM稅別判斷] 稅別: {tax_type}，已勾選: {tax_found}")
+    else:
+        print(f"⚠️  [VLM稅別判斷] 無法判斷（回傳: {vlm_tax_result}），改用 LLM OCR 文字判斷")
+        tax_result = determine_tax_type_by_llm(ocr_text_with_position)
+        tax_type = tax_result.get("稅別")
+        tax_found = tax_result.get("已勾選", False)
+
     print(f"  稅別: {tax_type}，已勾選: {tax_found}，依據: {tax_result.get('判斷依據')}")
 
     # ---------------------------------
@@ -1895,12 +1955,20 @@ for i, page in enumerate(pages):
 
         print(f"\n[LLM重試] 第{retry_attempt+1}次，失敗欄位：{failed_fields}")
 
-        # ✅ 「營業稅稅別判斷」失敗：重新呼叫 determine_tax_type_by_llm 重試
+        # ✅ 「營業稅稅別判斷」失敗：優先用 VLM 判斷，LLM 作為備援
         if "營業稅稅別判斷" in failed_fields:
             print(f"[LLM重試] 重新判斷稅別...")
-            tax_retry_result = determine_tax_type_by_llm(ocr_text_with_position)
-            tax_type  = tax_retry_result.get("稅別")
-            tax_found = tax_retry_result.get("已勾選", False)
+            vlm_tax_retry = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
+            vlm_tax_retry_val = str(vlm_tax_retry.get("營業稅稅別判斷") or "").strip() if vlm_tax_retry else ""
+
+            if vlm_tax_retry_val in VALID_TAX_TYPES:
+                tax_type = vlm_tax_retry_val
+                tax_found = True
+            else:
+                tax_retry_result = determine_tax_type_by_llm(ocr_text_with_position)
+                tax_type  = tax_retry_result.get("稅別")
+                tax_found = tax_retry_result.get("已勾選", False)
+
             print(f"[LLM重試] 稅別重試結果：{tax_type}，已勾選={tax_found}")
             # 重新計算稅額/合計的標準答案
             if std_sales_amount is not None and tax_type is not None:
@@ -1986,91 +2054,22 @@ for i, page in enumerate(pages):
     VLM_MAX_RETRY        = 2
     final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
     if final_failed_fields:
-        print(f"\n[VLM保底] LLM重試{MAX_FIELD_RETRY}次仍失敗：{final_failed_fields}")
-        print(f"[VLM保底] 改用 VLM 圖片理解，最多重試 {VLM_MAX_RETRY} 次...")
+        # 稅別獨立重試，避免在多欄位 VLM 擷取時互相干擾
+        if "營業稅稅別判斷" in final_failed_fields:
+            print("\n[VLM稅別專用補救] 失敗欄位包含稅別，先單獨重試稅別...")
+            vlm_tax_retry = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
+            vlm_tax_retry_val = str(vlm_tax_retry.get("營業稅稅別判斷") or "").strip() if vlm_tax_retry else ""
 
-        vlm_current_fields = list(final_failed_fields)
-
-        for vlm_attempt in range(1, VLM_MAX_RETRY + 1):
-            print(f"\n[VLM保底] 第{vlm_attempt}次，擷取欄位：{vlm_current_fields}")
-
-            # ✅ 第2次起：先讓 LLM 定位失敗欄位區域，裁切後再給 VLM
-            if vlm_attempt >= 2:
-                print(f"[VLM保底] 嘗試 LLM 區域定位裁切...")
-                bbox_result = locate_field_region_by_llm(ocr_text_with_position, vlm_current_fields)
-
-                if bbox_result and all(k in bbox_result for k in ["x1", "y1", "x2", "y2"]):
-                    print(f"[VLM保底] LLM 定位結果：{bbox_result}（reason: {bbox_result.get('reason', '')}）")
-
-                    cropped = crop_image_region(
-                        page,
-                        [bbox_result["x1"], bbox_result["y1"], bbox_result["x2"], bbox_result["y2"]],
-                        padding=0
-                    )
-                    vlm_input_image = cropped
-
-                    # ✅ 儲存裁切圖片供 debug 確認
-                    os.makedirs("vlm_crop_debug", exist_ok=True)
-                    crop_save_path = f"vlm_crop_debug/page{i+1}_attempt{vlm_attempt}_{'_'.join(vlm_current_fields)}.png"
-                    cropped.save(crop_save_path)
-                    print(f"[VLM保底] 裁切圖片已儲存：{crop_save_path}，尺寸：{cropped.size}")
-
-                else:
-                    print(f"[VLM保底] LLM 定位失敗，改用整張圖")
-                    vlm_input_image = page
+            if vlm_tax_retry_val in VALID_TAX_TYPES:
+                tax_type = vlm_tax_retry_val
+                tax_found = True
+                if std_sales_amount is not None:
+                    std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
+                    std_total_amount = std_sales_amount + std_tax_amount
+                print(f"[VLM稅別專用補救] 稅別更新為 {tax_type}，標準稅額={std_tax_amount}，合計={std_total_amount}")
             else:
-                # 第1次：整張圖
-                vlm_input_image = page
+                print(f"[VLM稅別專用補救] 仍無法判斷有效稅別（回傳：{vlm_tax_retry}）")
 
-            vlm_result = extract_fields_from_image_region(vlm_input_image, vlm_current_fields)
-
-            if not vlm_result:
-                print(f"⚠️  [VLM保底] 第{vlm_attempt}次回傳空值")
-                if vlm_attempt == VLM_MAX_RETRY:
-                    validation_result["需人工審核欄位"] = vlm_current_fields
-                continue
-
-            # ✅ 更新對應欄位變數
-            for field in vlm_current_fields:
-                val = vlm_result.get(field)
-                if val is None:
-                    continue
-                print(f"[VLM保底] 第{vlm_attempt}次 更新欄位 [{field}]: → {val}")
-
-                if field == "發票號碼":
-                    extracted_invoice_no = val
-                elif field == "買方統編":
-                    buyer_tax_id = val
-                elif field == "賣方統編":
-                    seller_tax_id = val
-                elif field == "買方公司名稱":
-                    buyer_company_name = val
-                elif field == "賣方公司名稱":
-                    seller_company_name = val
-                elif field == "營業稅稅別判斷":
-                    # ✅ VLM 回傳的稅別字串（"應稅"/"零稅率"/"免稅"/null）解析為 tax_type/tax_found
-                    VALID_TAX_TYPES = ["應稅", "零稅率", "免稅"]
-                    vlm_tax = str(val).strip() if val else None
-                    if vlm_tax in VALID_TAX_TYPES:
-                        tax_type  = vlm_tax
-                        tax_found = True
-                        print(f"[VLM保底] 稅別更新：{tax_type}（已勾選）")
-                        # 重新計算稅額/合計標準答案
-                        if std_sales_amount is not None:
-                            std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
-                            std_total_amount = std_sales_amount + std_tax_amount
-                            print(f"[VLM保底] 重新計算標準答案: 稅額={std_tax_amount}, 合計={std_total_amount}")
-                    else:
-                        tax_type  = None
-                        tax_found = False
-                        print(f"[VLM保底] 稅別仍未找到（回傳：{val}）")
-                elif field == "發票日期":
-                    invoice_date = val
-                    print(f"[LLM重試] 發票日期更新：{invoice_date}")
-                else:
-                    llm_fields[field] = val
-
-            # ✅ 重新比對，確認內容是否正確
             compare_result = compare_with_standard(
                 buyer_tax_id, seller_tax_id,
                 buyer_company_name, seller_company_name,
@@ -2084,29 +2083,126 @@ for i, page in enumerate(pages):
                 std_tax_amount=std_tax_amount,
                 std_total_amount=std_total_amount
             )
+            final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
 
-            vlm_still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+        print(f"\n[VLM保底] LLM重試{MAX_FIELD_RETRY}次仍失敗：{final_failed_fields}")
+        print(f"[VLM保底] 改用 VLM 圖片理解，最多重試 {VLM_MAX_RETRY} 次...")
 
-            if not vlm_still_failed:
-                print(f"[VLM保底] 第{vlm_attempt}次比對通過 ✅")
-                break
+        vlm_current_fields = [f for f in final_failed_fields if f != "營業稅稅別判斷"]
 
-            print(f"[VLM保底] 第{vlm_attempt}次比對後仍失敗：{vlm_still_failed}")
+        if not vlm_current_fields:
+            print("[VLM保底] 無需多欄位 VLM 補救（僅稅別欄位已處理）")
+        else:
+            for vlm_attempt in range(1, VLM_MAX_RETRY + 1):
+                print(f"\n[VLM保底] 第{vlm_attempt}次，擷取欄位：{vlm_current_fields}")
 
-            if vlm_attempt == VLM_MAX_RETRY:
-                print(f"[VLM保底] 已達最大重試次數（{VLM_MAX_RETRY}次），轉人工審核")
-                validation_result["需人工審核欄位"] = vlm_still_failed
-            else:
-                # ✅ 下一輪只針對仍失敗的欄位
-                vlm_current_fields = vlm_still_failed
-                print(f"[VLM保底] 下一次只針對失敗欄位重試：{vlm_current_fields}")
+                # ✅ 第2次起：先讓 LLM 定位失敗欄位區域，裁切後再給 VLM
+                if vlm_attempt >= 2:
+                    print(f"[VLM保底] 嘗試 LLM 區域定位裁切...")
+                    bbox_result = locate_field_region_by_llm(ocr_text_with_position, vlm_current_fields)
 
-    # ✅ 發票日期加入 compare_result
-    compare_result["發票日期"] = {
-        "OCR結果":  invoice_date or "未找到",
-        "說明":     "只要有值即通過",
-        "是否一致": bool(invoice_date)
-    }
+                    if bbox_result and all(k in bbox_result for k in ["x1", "y1", "x2", "y2"]):
+                        print(f"[VLM保底] LLM 定位結果：{bbox_result}（reason: {bbox_result.get('reason', '')}）")
+
+                        cropped = crop_image_region(
+                            page,
+                            [bbox_result["x1"], bbox_result["y1"], bbox_result["x2"], bbox_result["y2"]],
+                            padding=0
+                        )
+                        vlm_input_image = cropped
+
+                        # ✅ 儲存裁切圖片供 debug 確認
+                        os.makedirs("vlm_crop_debug", exist_ok=True)
+                        crop_save_path = f"vlm_crop_debug/page{i+1}_attempt{vlm_attempt}_{'_'.join(vlm_current_fields)}.png"
+                        cropped.save(crop_save_path)
+                        print(f"[VLM保底] 裁切圖片已儲存：{crop_save_path}，尺寸：{cropped.size}")
+
+                    else:
+                        print(f"[VLM保底] LLM 定位失敗，改用整張圖")
+                        vlm_input_image = page
+                else:
+                    # 第1次：整張圖
+                    vlm_input_image = page
+
+                vlm_result = extract_fields_from_image_region(vlm_input_image, vlm_current_fields)
+
+                if not vlm_result:
+                    print(f"⚠️  [VLM保底] 第{vlm_attempt}次回傳空值")
+                    if vlm_attempt == VLM_MAX_RETRY:
+                        validation_result["需人工審核欄位"] = vlm_current_fields
+                    continue
+
+                # ✅ 更新對應欄位變數
+                for field in vlm_current_fields:
+                    val = vlm_result.get(field)
+                    if val is None:
+                        continue
+                    print(f"[VLM保底] 第{vlm_attempt}次 更新欄位 [{field}]: → {val}")
+
+                    if field == "發票號碼":
+                        extracted_invoice_no = val
+                    elif field == "買方統編":
+                        buyer_tax_id = val
+                    elif field == "賣方統編":
+                        seller_tax_id = val
+                    elif field == "買方公司名稱":
+                        buyer_company_name = val
+                    elif field == "賣方公司名稱":
+                        seller_company_name = val
+                    elif field == "營業稅稅別判斷":
+                        # ✅ VLM 回傳的稅別字串（"應稅"/"零稅率"/"免稅"/null）解析為 tax_type/tax_found
+                        VALID_TAX_TYPES = ["應稅", "零稅率", "免稅"]
+                        vlm_tax = str(val).strip() if val else None
+                        if vlm_tax in VALID_TAX_TYPES:
+                            tax_type  = vlm_tax
+                            tax_found = True
+                            print(f"[VLM保底] 稅別更新：{tax_type}（已勾選）")
+                            # 重新計算稅額/合計標準答案
+                            if std_sales_amount is not None:
+                                std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
+                                std_total_amount = std_sales_amount + std_tax_amount
+                                print(f"[VLM保底] 重新計算標準答案: 稅額={std_tax_amount}, 合計={std_total_amount}")
+                        else:
+                            tax_type  = None
+                            tax_found = False
+                            print(f"[VLM保底] 稅別仍未找到（回傳：{val}）")
+                    elif field == "發票日期":
+                        invoice_date = val
+                        print(f"[LLM重試] 發票日期更新：{invoice_date}")
+                    else:
+                        llm_fields[field] = val
+
+                # ✅ 重新比對，確認內容是否正確
+                compare_result = compare_with_standard(
+                    buyer_tax_id, seller_tax_id,
+                    buyer_company_name, seller_company_name,
+                    amount_validation, extracted_invoice_no,
+                    standard, llm_fields,
+                    active_rules=prefix_rule["rules"],
+                    active_detail_fields=prefix_rule["detail_fields"],
+                    tax_type=tax_type,
+                    tax_found=tax_found,
+                    std_sales_amount=std_sales_amount,
+                    std_tax_amount=std_tax_amount,
+                    std_total_amount=std_total_amount
+                )
+
+                vlm_still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+
+                if not vlm_still_failed:
+                    print(f"[VLM保底] 第{vlm_attempt}次比對通過 ✅")
+                    break
+
+                print(f"[VLM保底] 第{vlm_attempt}次比對後仍失敗：{vlm_still_failed}")
+
+                if vlm_attempt == VLM_MAX_RETRY:
+                    print(f"[VLM保底] 已達最大重試次數（{VLM_MAX_RETRY}次），轉人工審核")
+                    validation_result["需人工審核欄位"] = vlm_still_failed
+                else:
+                    # ✅ 下一輪只針對仍失敗的欄位
+                    vlm_current_fields = vlm_still_failed
+                    print(f"[VLM保底] 下一次只針對失敗欄位重試：{vlm_current_fields}")
+
 
     validation_result["與Excel比對結果"] = compare_result
 

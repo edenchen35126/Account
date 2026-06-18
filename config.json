@@ -4,8 +4,8 @@
   "poppler_path": "Release-25.12.0-0/poppler-25.12.0/Library/bin",
   "font_path": "fonts/msjh.ttc",
   "dpi": 700,
-  "pdf_path": "file/split_output/scan-00003/丁種字軌1.pdf",
-  "pdf_name": "丁種字軌1",
+  "pdf_path": "file/split_output/scan-00003/甲種字軌1.pdf",
+  "pdf_name": "甲種字軌1",
   "detail_field_presets": {
     "FULL": [
       "品名",
@@ -44,9 +44,48 @@
         "未稅金額",
         "稅額",
         "合計金額",
-        "明細項目"
+        "明細項目",
+        "發票日期"
       ],
       "detail_fields": "FULL"
+    },
+    {
+      "prefixes": [
+        "BA"
+      ],
+      "rules": [
+        "發票號碼",
+        "買方統編",
+        "賣方統編",
+        "賣方公司名稱",
+        "營業稅稅別判斷",
+        "未稅金額",
+        "稅額",
+        "合計金額",
+        "明細項目",
+        "發票日期"
+      ],
+      "detail_fields": "AMOUNT"
+    },
+    {
+      "prefixes": [
+        "ZX"
+      ],
+      "rules": [
+        "發票號碼",
+        "買方統編",
+        "賣方統編",
+        "買方公司名稱",
+        "賣方公司名稱",
+        "營業稅稅別判斷",
+        "金額大寫中文",
+        "未稅金額",
+        "稅額",
+        "合計金額",
+        "明細項目",
+        "發票日期"
+      ],
+      "detail_fields": "AMOUNT"
     }
   ]
 }
