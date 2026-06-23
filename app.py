@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont  , ImageEnhance, ImageFilter # 圖�
 import pandas as pd                      # Excel 讀取
 
 # ✅ 引入 VLM 判斷函式
-from vlm import detect_multi_invoice, extract_fields_from_image_region, crop_image_region
+from vlm import detect_multi_invoice, extract_fields_from_image_region, crop_image_region, detect_total_ntd_text, extract_invoice_number_from_image
 # ✅ 引入 LLM 擷取函式
 from llm import (
     extract_invoice_fields_by_llm,
@@ -117,13 +117,8 @@ _DETAIL_PRESETS = config.get("detail_field_presets", {
 
 INVOICE_PREFIX_RULES = {}
 for _group in config.get("invoice_prefix_groups", []):
-    _preset_key    = _group.get("detail_fields", "FULL")
-    _detail_fields = _DETAIL_PRESETS.get(_preset_key, _DETAIL_PRESETS["FULL"])
     for _prefix in _group.get("prefixes", []):
-        INVOICE_PREFIX_RULES[_prefix] = {
-            "rules":         _group["rules"],
-            "detail_fields": _detail_fields
-        }
+        INVOICE_PREFIX_RULES[_prefix] = _group
 
 
 
@@ -345,7 +340,7 @@ def build_ocr_text_with_position(ocr_items: list) -> str:
 
     return "\n".join(result_lines)
 
-def get_validation_rules_by_prefix(invoice_no: str) -> dict:
+def get_validation_rules_by_prefix(invoice_no: str, page_text_clean: str = "", page_image=None) -> dict:
     """根據發票號碼前兩碼英文，決定要檢核的項目"""
     if not invoice_no or len(invoice_no) < 2:
         print(f"⚠️  無法取得發票前綴，轉人工審核")
@@ -358,12 +353,42 @@ def get_validation_rules_by_prefix(invoice_no: str) -> dict:
         return {"prefix": prefix, "rules": None, "detail_fields": None, "unknown": True}
 
     prefix_config = INVOICE_PREFIX_RULES[prefix]
+
+    if "condition" in prefix_config:
+        keywords = prefix_config["condition"]["keywords"]
+        matched = any(keyword in page_text_clean for keyword in keywords)
+        condition_source = "OCR"
+
+        if not matched and page_image is not None:
+            vlm_condition = detect_total_ntd_text(page_image)
+            matched = bool(vlm_condition.get("has_total_ntd_text", False))
+            condition_source = f"VLM({vlm_condition.get('reason', '')})"
+
+        selected = prefix_config["when_true"] if matched else prefix_config["when_false"]
+        print(f"[前綴規則條件] 是否有總計新臺幣字樣: {matched}，來源: {condition_source}")
+    else:
+        selected = prefix_config
+
+    detail_fields_key = selected.get("detail_fields", "FULL")
     return {
-        "prefix":        prefix,
-        "rules":         prefix_config["rules"],
-        "detail_fields": prefix_config["detail_fields"],  # ✅ 新增
-        "unknown":       False
+        "prefix": prefix,
+        "rules": selected["rules"],
+        "detail_fields": _DETAIL_PRESETS.get(detail_fields_key, _DETAIL_PRESETS["FULL"]),
+        "unknown": False
     }
+    # prefix = invoice_no[:2].upper()
+
+    # if prefix not in INVOICE_PREFIX_RULES:
+    #     print(f"⚠️  發票前綴 [{prefix}] 找不到對應檢核規則，轉人工審核")
+    #     return {"prefix": prefix, "rules": None, "detail_fields": None, "unknown": True}
+
+    # prefix_config = INVOICE_PREFIX_RULES[prefix]
+    # return {
+    #     "prefix":        prefix,
+    #     "rules":         prefix_config["rules"],
+    #     "detail_fields": prefix_config["detail_fields"],  # ✅ 新增
+    #     "unknown":       False
+    # }
 
 def cv2_imwrite_unicode(path: str, img):
     """支援中文路徑的 cv2.imwrite 替代函式"""
@@ -1763,7 +1788,7 @@ for i, page in enumerate(pages):
         return cleaned if re.fullmatch(r'[A-Z]{2}\d{6,8}', cleaned) else None
 
     # ✅ 依發票前兩碼決定檢核規則
-    prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no)
+    prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
     print(f"\n  發票前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
 
     # ✅ 發票前綴找不到/未設定時：先用 LLM 補抓發票號碼，再用 VLM 保底
@@ -1776,7 +1801,7 @@ for i, page in enumerate(pages):
             extracted_invoice_no = llm_invoice_no
             lookup_invoice_no    = llm_invoice_no
             extracted_data["發票號碼"] = llm_invoice_no
-            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no)
+            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
             print(f"[前綴補救][LLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
         else:
             print(f"⚠️  [前綴補救][LLM] 仍無法取得可用發票號碼")
@@ -1786,11 +1811,27 @@ for i, page in enumerate(pages):
         vlm_invoice_retry = extract_fields_from_image_region(page, ["發票號碼"])
         vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
 
+        if not vlm_invoice_no:
+            print(f"⚠️  [前綴補救][VLM] 整張圖仍無法取得發票號碼，改裁切上方字軌區重試")
+            page_w, page_h = page.size
+            invoice_no_crop = crop_image_region(
+                page,
+                [0, 0, page_w, int(page_h * 0.25)],
+                padding=0
+            )
+            os.makedirs("vlm_crop_debug", exist_ok=True)
+            invoice_no_crop_path = f"vlm_crop_debug/page{i+1}_invoice_no_top.png"
+            invoice_no_crop.save(invoice_no_crop_path)
+            print(f"[前綴補救][VLM] 發票號碼裁切圖片已儲存：{invoice_no_crop_path}，尺寸：{invoice_no_crop.size}")
+
+            vlm_invoice_retry = extract_invoice_number_from_image(invoice_no_crop)
+            vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
+
         if vlm_invoice_no:
             extracted_invoice_no = vlm_invoice_no
             lookup_invoice_no    = vlm_invoice_no
             extracted_data["發票號碼"] = vlm_invoice_no
-            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no)
+            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
             print(f"[前綴補救][VLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
         else:
             print(f"⚠️  [前綴補救][VLM] 仍無法取得可用發票號碼")
@@ -1901,8 +1942,14 @@ for i, page in enumerate(pages):
         valid_sum = True
         for detail_item in ocr_detail_items:
             amt_str = str(detail_item.get("金額") or "").replace(",", "").strip()
+
+            # 空白金額不可當作 0，否則會把標準答案錯算成 0
+            if not amt_str:
+                valid_sum = False
+                break
+
             try:
-                total_from_detail += int(float(amt_str)) if amt_str else 0
+                total_from_detail += int(float(amt_str))
             except (ValueError, TypeError):
                 valid_sum = False
                 break
@@ -2017,8 +2064,14 @@ for i, page in enumerate(pages):
                 valid_sum = True
                 for detail_item in updated_detail_items:
                     amt_str = str(detail_item.get("金額") or "").replace(",", "").strip()
+
+                    # 空白金額不可當作 0，避免 LLM 重試用不完整明細覆蓋標準答案
+                    if not amt_str:
+                        valid_sum = False
+                        break
+
                     try:
-                        total_from_detail += int(float(amt_str)) if amt_str else 0
+                        total_from_detail += int(float(amt_str))
                     except (ValueError, TypeError):
                         valid_sum = False
                         break
@@ -2133,6 +2186,7 @@ for i, page in enumerate(pages):
                     continue
 
                 # ✅ 更新對應欄位變數
+                vlm_detail_updated = False
                 for field in vlm_current_fields:
                     val = vlm_result.get(field)
                     if val is None:
@@ -2171,6 +2225,33 @@ for i, page in enumerate(pages):
                         print(f"[LLM重試] 發票日期更新：{invoice_date}")
                     else:
                         llm_fields[field] = val
+                        if field == "明細項目":
+                            vlm_detail_updated = True
+
+                # VLM 補到完整明細時，立刻用明細金額重算標準答案
+                if vlm_detail_updated:
+                    updated_detail_items = llm_fields.get("明細項目", [])
+                    if updated_detail_items:
+                        total_from_detail = 0
+                        valid_sum = True
+                        for detail_item in updated_detail_items:
+                            amt_str = str(detail_item.get("金額") or "").replace(",", "").strip()
+
+                            if not amt_str:
+                                valid_sum = False
+                                break
+
+                            try:
+                                total_from_detail += int(float(amt_str))
+                            except (ValueError, TypeError):
+                                valid_sum = False
+                                break
+
+                        if valid_sum:
+                            std_sales_amount = total_from_detail
+                            std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
+                            std_total_amount = std_sales_amount + std_tax_amount
+                            print(f"[VLM保底] 重新計算標準答案: 未稅={std_sales_amount}, 稅額={std_tax_amount}, 合計={std_total_amount}")
 
                 # ✅ 重新比對，確認內容是否正確
                 compare_result = compare_with_standard(
@@ -2233,6 +2314,26 @@ for i, page in enumerate(pages):
                 print(f"    ❌ 第{f['第幾筆']}筆 [{f['品名']}] 失敗欄位：{f['失敗欄位']}")
         else:
             print(f"  {k}: {v}")
+
+    print(f"\n第 {i+1} 頁 輸出OCR+LLM結果摘要:")
+    for k, v in compare_result.items():
+        if k == "全部比對通過":
+            continue
+
+        if k == "明細項目" and isinstance(v, dict):
+            detail_ocr_summary = {
+                field: summary.get("OCR結果")
+                for field, summary in v.get("欄位摘要", {}).items()
+                if isinstance(summary, dict)
+            }
+            print(f"  {k}: {{'OCR結果': {detail_ocr_summary}}}")
+        elif isinstance(v, dict):
+            if "OCR結果" in v:
+                print(f"  {k}: {{'OCR結果': {repr(v.get('OCR結果'))}}}")
+            elif "結果" in v:
+                print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}}}")
+
+
 
     print(f"\n第 {i+1} 頁 TSR cells 數量: {len(cells)}")
     print("-" * 50)

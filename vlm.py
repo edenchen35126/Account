@@ -59,7 +59,7 @@ def extract_fields_from_image_region(
         "稅額":       "- 稅額：營業稅金額（純數字，去除逗號）",
         "合計金額":    "- 合計金額：含稅總計金額（純數字，去除逗號）",
         "年度期間":    "- 年度期間：格式為「民國年份年MM-MM月」，例如「115年03-04月」",
-        "發票號碼":    "- 發票號碼：2個英文字母+8個數字，例如「AY83205584」",
+          "發票號碼":    "- 發票號碼：2個英文字母+8個數字，例如「AY83205584」",
         "買方統編":    "- 買方統編：買方的8位數字統一編號",
         "賣方統編":    "- 賣方統編：賣方的8位數字統一編號",
         "買方公司名稱": "- 買方公司名稱：完整買方公司名稱",
@@ -192,6 +192,115 @@ def extract_fields_from_image_region(
     except Exception as e:
         print(f"⚠️  [VLM保底] 呼叫失敗：{e}")
         return {}
+
+
+def extract_invoice_number_from_image(image_pil: Image.Image, known_prefix: str = None) -> dict:
+    """專用 VLM：只辨識發票號碼，避免通用欄位提示分散注意力。"""
+    prefix_hint = ""
+    if known_prefix:
+        prefix_hint = f"\n已知字軌英文字母可能是「{known_prefix}」。如果你只看到 8 位數字，請和 {known_prefix} 合併成完整發票號碼。"
+
+    prompt = f"""請只判斷這張圖片中的發票號碼。
+
+發票號碼格式：
+- 2 個英文字母 + 8 個數字
+- 例如 AY83205584、ZX11414651
+
+請特別看圖片左上方或上方偏左的發票字軌區。
+如果看到英文字母（例如 ZX），並且右側或附近斜線底紋區有 8 位數字，請合併成完整發票號碼。{prefix_hint}
+
+不要輸出：
+- 買方統編
+- 賣方統編
+- 日期
+- 電話
+- 金額
+- 地址
+
+請只回傳 JSON，不要加任何說明：
+{{
+  "發票號碼": "<2個英文字母+8個數字或null>",
+  "reason": "<簡短原因>"
+}}"""
+
+    try:
+        b64_image = image_to_base64(image_pil)
+
+        response = client.chat.completions.create(
+            model=VLLM_LLM_MODEL2,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}
+                ]
+            }],
+            max_tokens=256,
+            temperature=0.0
+        )
+
+        content = (response.choices[0].message.content or "").strip()
+        print(f"[VLM發票號碼專用] 回應:\n{content}\n")
+
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            print("⚠️  [VLM發票號碼專用] 找不到 JSON")
+            return {"發票號碼": None, "reason": "VLM回應非JSON"}
+
+        result = json.loads(json_match.group())
+        return {
+            "發票號碼": result.get("發票號碼"),
+            "reason": result.get("reason", "")
+        }
+
+    except Exception as e:
+        print(f"⚠️  [VLM發票號碼專用] 呼叫失敗：{e}")
+        return {"發票號碼": None, "reason": f"VLM呼叫失敗：{e}"}
+
+
+def detect_total_ntd_text(image_pil: Image.Image) -> dict:
+    """用 VLM 判斷發票是否出現「總計新臺幣/總計新台幣」字樣。"""
+    prompt = """請判斷這張台灣統一發票圖片中，是否有出現「總計新臺幣」或「總計新台幣」字樣。
+
+請只回傳 JSON，不要加任何說明：
+{
+  "has_total_ntd_text": true 或 false,
+  "matched_text": "看到的文字或null",
+  "reason": "簡短原因"
+}"""
+
+    try:
+        b64_image = image_to_base64(image_pil)
+        response = client.chat.completions.create(
+            model=VLLM_LLM_MODEL2,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}
+                ]
+            }],
+            max_tokens=256,
+            temperature=0.0
+        )
+
+        content = (response.choices[0].message.content or "").strip()
+        print(f"[VLM總計新臺幣判斷] 回應:\n{content}\n")
+
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            return {"has_total_ntd_text": False, "matched_text": None, "reason": "VLM回應非JSON"}
+
+        result = json.loads(json_match.group())
+        return {
+            "has_total_ntd_text": bool(result.get("has_total_ntd_text", False)),
+            "matched_text": result.get("matched_text"),
+            "reason": result.get("reason", "")
+        }
+
+    except Exception as e:
+        print(f"⚠️  [VLM總計新臺幣判斷] 呼叫失敗：{e}")
+        return {"has_total_ntd_text": False, "matched_text": None, "reason": f"VLM呼叫失敗：{e}"}
 
 # =========================
 # VLM 判斷是否有多張發票
