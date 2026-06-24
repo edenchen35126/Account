@@ -121,6 +121,84 @@ for _group in config.get("invoice_prefix_groups", []):
         INVOICE_PREFIX_RULES[_prefix] = _group
 
 
+def _norm_for_match(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().upper()
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("-", "")
+    return s
+
+def get_ocr_confidence_for_value(ocr_items: list, target_value: str) -> float | None:
+    """
+    用最小侵入方式估 OCR 信心值：
+    - 先找完全匹配
+    - 找不到再找包含關係
+    - 回傳匹配到的最高 score
+    """
+    tgt = _norm_for_match(target_value)
+    if not tgt:
+        return None
+
+    best = None
+    for item in ocr_items:
+        txt = _norm_for_match(item.get("text", ""))
+        score = item.get("score")
+        if score is None:
+            continue
+
+        if txt == tgt or (tgt in txt) or (txt in tgt):
+            best = score if best is None else max(best, score)
+
+    return round(best, 4) if best is not None else None
+
+
+def estimate_field_confidence(ocr_items: list, field_name: str, field_value, source: str) -> float | None:
+    """
+    統一估算欄位信心值（不影響原本判斷流程）：
+    1) 只針對 OCR 欄位估算
+    2) LLM/VLM 欄位不在此估算，改由模型 prompt 直接回傳
+    """
+    if field_value is None:
+        return None
+
+    source = (source or "").upper()
+
+    if source != "OCR":
+        return None
+
+    # 明細項目是 list[dict]，取可匹配到 OCR 的分數平均
+    if field_name == "明細項目" and isinstance(field_value, list):
+        matched_scores = []
+        for item in field_value:
+            if not isinstance(item, dict):
+                continue
+            for key in ["品名", "數量", "單價", "金額"]:
+                val = item.get(key)
+                if val:
+                    sc = get_ocr_confidence_for_value(ocr_items, str(val))
+                    if sc is not None:
+                        matched_scores.append(sc)
+
+        if matched_scores:
+            return round(sum(matched_scores) / len(matched_scores), 4)
+        return None
+
+    # 一般欄位：先試 OCR 對齊
+    conf = get_ocr_confidence_for_value(ocr_items, str(field_value))
+    if conf is not None:
+        return conf
+
+    return None
+
+
+def format_confidence(conf_value) -> str:
+    if conf_value is None:
+        return "N/A"
+    try:
+        return f"{float(conf_value):.2f}"
+    except (ValueError, TypeError):
+        return "N/A"
 
 def compare_detail_items(ocr_items: list, std_items: list, active_detail_fields: list = None) -> dict:
     if active_detail_fields is None:
@@ -1114,13 +1192,15 @@ def run_ocr(image_path):
         ocr_data = data.get("res", data)
         texts = ocr_data.get("rec_texts", [])
         polys = ocr_data.get("rec_polys", ocr_data.get("dt_polys", []))
+        scores = ocr_data.get("rec_scores", [None] * len(texts))
 
-        for text, poly in zip(texts, polys):
+        for text, poly, score in zip(texts, polys, scores):
             bbox = poly_to_bbox(poly)
             ocr_items.append({
-                "text": cc.convert(text),  # 簡體轉繁體
+                "text": cc.convert(text),
                 "poly": np.array(poly).astype(int).tolist(),
-                "bbox": bbox
+                "bbox": bbox,
+                "score": float(score) if score is not None else None
             })
 
     return ocr_items
@@ -1686,6 +1766,24 @@ standard_dict = load_excel_standard(EXCEL_PATH)
 all_pages_result = []
 
 for i, page in enumerate(pages):
+    field_confidence = {}   # 欄位 -> 信心值
+    field_source = {}       # 欄位 -> "OCR" / "LLM" / "VLM"
+
+    def set_field_meta(field_name: str, field_value, source_name: str, model_confidence: float | None = None):
+        """更新欄位來源與信心值（只做紀錄，不改既有判斷邏輯）。"""
+        if field_value is None:
+            return
+        if isinstance(field_value, str) and not field_value.strip():
+            return
+        field_source[field_name] = source_name
+        if model_confidence is not None:
+            field_confidence[field_name] = model_confidence
+            return
+        if source_name == "OCR":
+            field_confidence[field_name] = estimate_field_confidence(
+                ocr_items, field_name, field_value, source_name
+            )
+
     # --- 圖片轉換與儲存 ---
     img = np.array(page)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -1721,6 +1819,7 @@ for i, page in enumerate(pages):
     # 1. OCR branch：執行文字辨識
     # ---------------------------------
     ocr_items = run_ocr(jpg_path)
+    print(ocr_items)
 
     # 將所有辨識文字合併成純文字字串
     page_text       = "\n".join([item["text"] for item in ocr_items])
@@ -1772,6 +1871,27 @@ for i, page in enumerate(pages):
     
 
     # ---------------------------------
+    # OCR 階段先填 OCR 欄位的信心值
+    # ---------------------------------
+    # OCR來源欄位（先給初值，後續若被 LLM/VLM 覆蓋再更新）
+    ocr_field_values = {
+        "發票號碼": extracted_data.get("發票號碼"),
+        "買方統編": buyer_tax_id,
+        "賣方統編": seller_tax_id,
+        "買方公司名稱": buyer_company_name,
+        "賣方公司名稱": seller_company_name,
+    }
+
+    for k, val in ocr_field_values.items():
+        conf = get_ocr_confidence_for_value(ocr_items, val)
+        if conf is not None:
+            field_confidence[k] = conf
+            field_source[k] = "OCR"
+        elif val:
+            field_source[k] = "OCR"
+
+
+    # ---------------------------------
     # 4.5 與 Excel 標準答案比對
     # ---------------------------------
     extracted_invoice_no = extracted_data.get("發票號碼")
@@ -1795,12 +1915,14 @@ for i, page in enumerate(pages):
     if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
         print(f"⚠️  發票前綴無法使用，先改用 LLM 重新擷取發票號碼")
         llm_invoice_retry = reextract_specific_fields(ocr_text_with_position, ["發票號碼"])
+        llm_invoice_conf_map = llm_invoice_retry.get("__field_confidence__", {}) if llm_invoice_retry else {}
         llm_invoice_no = clean_invoice_no_candidate(llm_invoice_retry.get("發票號碼") if llm_invoice_retry else None)
 
         if llm_invoice_no:
             extracted_invoice_no = llm_invoice_no
             lookup_invoice_no    = llm_invoice_no
             extracted_data["發票號碼"] = llm_invoice_no
+            set_field_meta("發票號碼", llm_invoice_no, "LLM", llm_invoice_conf_map.get("發票號碼"))
             prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
             print(f"[前綴補救][LLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
         else:
@@ -1809,6 +1931,7 @@ for i, page in enumerate(pages):
     if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
         print(f"⚠️  發票前綴仍無法使用，改用 VLM 圖片理解重新擷取發票號碼")
         vlm_invoice_retry = extract_fields_from_image_region(page, ["發票號碼"])
+        vlm_invoice_conf_map = vlm_invoice_retry.get("__field_confidence__", {}) if vlm_invoice_retry else {}
         vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
 
         if not vlm_invoice_no:
@@ -1825,12 +1948,14 @@ for i, page in enumerate(pages):
             print(f"[前綴補救][VLM] 發票號碼裁切圖片已儲存：{invoice_no_crop_path}，尺寸：{invoice_no_crop.size}")
 
             vlm_invoice_retry = extract_invoice_number_from_image(invoice_no_crop)
+            vlm_invoice_conf_map = vlm_invoice_retry.get("__field_confidence__", {}) if vlm_invoice_retry else {}
             vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
 
         if vlm_invoice_no:
             extracted_invoice_no = vlm_invoice_no
             lookup_invoice_no    = vlm_invoice_no
             extracted_data["發票號碼"] = vlm_invoice_no
+            set_field_meta("發票號碼", vlm_invoice_no, "VLM", vlm_invoice_conf_map.get("發票號碼"))
             prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
             print(f"[前綴補救][VLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
         else:
@@ -1860,8 +1985,13 @@ for i, page in enumerate(pages):
     print(f"\n===== 第 {i+1} 頁 LLM 欄位擷取 =====")
     # ocr_text_with_position = build_ocr_text_with_position(ocr_items)
     llm_fields = extract_invoice_fields_by_llm(ocr_text_with_position)
+    llm_fields_conf_map = llm_fields.get("__field_confidence__", {}) if isinstance(llm_fields, dict) else {}
     # ✅ 發票日期：從 llm_fields 取出（LLM 已一併擷取）
     invoice_date = llm_fields.get("發票日期")
+
+    # LLM 初次擷取欄位來源與信心值
+    for llm_field in ["年度期間", "發票日期", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目"]:
+        set_field_meta(llm_field, llm_fields.get(llm_field), "LLM", llm_fields_conf_map.get(llm_field))
 
     print(f"  發票日期:    {invoice_date}")
     print(f"  年度期間:    {llm_fields.get('年度期間')}")
@@ -1901,6 +2031,28 @@ for i, page in enumerate(pages):
                 failed.append(k)
         return failed
 
+    def expand_vlm_crop_bbox_for_fields(bbox_result: dict, fields: list, image_size: tuple[int, int]) -> list:
+        """針對特定欄位微調 VLM 裁切範圍，避免欄位內容被切掉。"""
+        page_w, page_h = image_size
+        x1 = int(bbox_result["x1"])
+        y1 = int(bbox_result["y1"])
+        x2 = int(bbox_result["x2"])
+        y2 = int(bbox_result["y2"])
+
+        if fields == ["買方統編"]:
+            # 統編 8 格通常由標籤右側水平延伸，定位容易只抓到左半邊。
+            x1 -= 120
+            y1 -= 120
+            x2 += 900
+            y2 += 180
+
+        return [
+            max(0, x1),
+            max(0, y1),
+            min(page_w, x2),
+            min(page_h, y2),
+        ]
+
     # ---------------------------------
     # ✅ 3.7 營業稅稅別判斷（應稅/零稅率/免稅）
     # ---------------------------------
@@ -1912,11 +2064,13 @@ for i, page in enumerate(pages):
 
     print("[VLM稅別判斷] 使用整張圖片，只判斷營業稅稅別...")
     vlm_tax_result = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
+    vlm_tax_conf_map = vlm_tax_result.get("__field_confidence__", {}) if vlm_tax_result else {}
     vlm_tax = str(vlm_tax_result.get("營業稅稅別判斷") or "").strip() if vlm_tax_result else ""
 
     if vlm_tax in VALID_TAX_TYPES:
         tax_type = vlm_tax
         tax_found = True
+        set_field_meta("營業稅稅別判斷", tax_type, "VLM", vlm_tax_conf_map.get("營業稅稅別判斷"))
         tax_result = {
             "稅別": tax_type,
             "已勾選": True,
@@ -1928,6 +2082,7 @@ for i, page in enumerate(pages):
         tax_result = determine_tax_type_by_llm(ocr_text_with_position)
         tax_type = tax_result.get("稅別")
         tax_found = tax_result.get("已勾選", False)
+        set_field_meta("營業稅稅別判斷", tax_type, "LLM", tax_result.get("信心值"))
 
     print(f"  稅別: {tax_type}，已勾選: {tax_found}，依據: {tax_result.get('判斷依據')}")
 
@@ -2006,15 +2161,18 @@ for i, page in enumerate(pages):
         if "營業稅稅別判斷" in failed_fields:
             print(f"[LLM重試] 重新判斷稅別...")
             vlm_tax_retry = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
+            vlm_tax_retry_conf_map = vlm_tax_retry.get("__field_confidence__", {}) if vlm_tax_retry else {}
             vlm_tax_retry_val = str(vlm_tax_retry.get("營業稅稅別判斷") or "").strip() if vlm_tax_retry else ""
 
             if vlm_tax_retry_val in VALID_TAX_TYPES:
                 tax_type = vlm_tax_retry_val
                 tax_found = True
+                set_field_meta("營業稅稅別判斷", tax_type, "VLM", vlm_tax_retry_conf_map.get("營業稅稅別判斷"))
             else:
                 tax_retry_result = determine_tax_type_by_llm(ocr_text_with_position)
                 tax_type  = tax_retry_result.get("稅別")
                 tax_found = tax_retry_result.get("已勾選", False)
+                set_field_meta("營業稅稅別判斷", tax_type, "LLM", tax_retry_result.get("信心值"))
 
             print(f"[LLM重試] 稅別重試結果：{tax_type}，已勾選={tax_found}")
             # 重新計算稅額/合計的標準答案
@@ -2029,6 +2187,7 @@ for i, page in enumerate(pages):
 
         if other_failed_fields:
             retry_result = reextract_specific_fields(ocr_text_with_position, other_failed_fields)
+            retry_conf_map = retry_result.get("__field_confidence__", {}) if retry_result else {}
             if not retry_result:
                 print(f"⚠️  [LLM重試] 回傳空值，放棄重試")
                 # 更新比對後直接 break
@@ -2042,19 +2201,26 @@ for i, page in enumerate(pages):
 
                     if field == "發票號碼":
                         extracted_invoice_no = val
+                        set_field_meta("發票號碼", val, "LLM", retry_conf_map.get("發票號碼"))
                     elif field == "買方統編":
                         buyer_tax_id = val
+                        set_field_meta("買方統編", val, "LLM", retry_conf_map.get("買方統編"))
                     elif field == "賣方統編":
                         seller_tax_id = val
+                        set_field_meta("賣方統編", val, "LLM", retry_conf_map.get("賣方統編"))
                     elif field == "買方公司名稱":
                         buyer_company_name = val
+                        set_field_meta("買方公司名稱", val, "LLM", retry_conf_map.get("買方公司名稱"))
                     elif field == "賣方公司名稱":
                         seller_company_name = val
+                        set_field_meta("賣方公司名稱", val, "LLM", retry_conf_map.get("賣方公司名稱"))
                     elif field == "發票日期":
                         invoice_date = val
+                        set_field_meta("發票日期", val, "LLM", retry_conf_map.get("發票日期"))
                         print(f"[VLM保底] 發票日期更新：{invoice_date}")
                     else:
                         llm_fields[field] = val
+                        set_field_meta(field, val, "LLM", retry_conf_map.get(field))
 
         # 重新計算未稅/稅額/合計金額標準答案（如果明細金額更新了）
         if "明細項目" in failed_fields:
@@ -2111,11 +2277,13 @@ for i, page in enumerate(pages):
         if "營業稅稅別判斷" in final_failed_fields:
             print("\n[VLM稅別專用補救] 失敗欄位包含稅別，先單獨重試稅別...")
             vlm_tax_retry = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
+            vlm_tax_retry_conf_map = vlm_tax_retry.get("__field_confidence__", {}) if vlm_tax_retry else {}
             vlm_tax_retry_val = str(vlm_tax_retry.get("營業稅稅別判斷") or "").strip() if vlm_tax_retry else ""
 
             if vlm_tax_retry_val in VALID_TAX_TYPES:
                 tax_type = vlm_tax_retry_val
                 tax_found = True
+                set_field_meta("營業稅稅別判斷", tax_type, "VLM", vlm_tax_retry_conf_map.get("營業稅稅別判斷"))
                 if std_sales_amount is not None:
                     std_tax_amount   = round(std_sales_amount * 0.05) if tax_type == "應稅" else 0
                     std_total_amount = std_sales_amount + std_tax_amount
@@ -2157,9 +2325,15 @@ for i, page in enumerate(pages):
                     if bbox_result and all(k in bbox_result for k in ["x1", "y1", "x2", "y2"]):
                         print(f"[VLM保底] LLM 定位結果：{bbox_result}（reason: {bbox_result.get('reason', '')}）")
 
+                        crop_bbox = expand_vlm_crop_bbox_for_fields(
+                            bbox_result,
+                            vlm_current_fields,
+                            page.size
+                        )
+
                         cropped = crop_image_region(
                             page,
-                            [bbox_result["x1"], bbox_result["y1"], bbox_result["x2"], bbox_result["y2"]],
+                            crop_bbox,
                             padding=0
                         )
                         vlm_input_image = cropped
@@ -2168,7 +2342,7 @@ for i, page in enumerate(pages):
                         os.makedirs("vlm_crop_debug", exist_ok=True)
                         crop_save_path = f"vlm_crop_debug/page{i+1}_attempt{vlm_attempt}_{'_'.join(vlm_current_fields)}.png"
                         cropped.save(crop_save_path)
-                        print(f"[VLM保底] 裁切圖片已儲存：{crop_save_path}，尺寸：{cropped.size}")
+                        print(f"[VLM保底] 裁切圖片已儲存：{crop_save_path}，bbox={crop_bbox}，尺寸：{cropped.size}")
 
                     else:
                         print(f"[VLM保底] LLM 定位失敗，改用整張圖")
@@ -2178,6 +2352,7 @@ for i, page in enumerate(pages):
                     vlm_input_image = page
 
                 vlm_result = extract_fields_from_image_region(vlm_input_image, vlm_current_fields)
+                vlm_conf_map = vlm_result.get("__field_confidence__", {}) if vlm_result else {}
 
                 if not vlm_result:
                     print(f"⚠️  [VLM保底] 第{vlm_attempt}次回傳空值")
@@ -2195,14 +2370,19 @@ for i, page in enumerate(pages):
 
                     if field == "發票號碼":
                         extracted_invoice_no = val
+                        set_field_meta("發票號碼", val, "VLM", vlm_conf_map.get("發票號碼"))
                     elif field == "買方統編":
                         buyer_tax_id = val
+                        set_field_meta("買方統編", val, "VLM", vlm_conf_map.get("買方統編"))
                     elif field == "賣方統編":
                         seller_tax_id = val
+                        set_field_meta("賣方統編", val, "VLM", vlm_conf_map.get("賣方統編"))
                     elif field == "買方公司名稱":
                         buyer_company_name = val
+                        set_field_meta("買方公司名稱", val, "VLM", vlm_conf_map.get("買方公司名稱"))
                     elif field == "賣方公司名稱":
                         seller_company_name = val
+                        set_field_meta("賣方公司名稱", val, "VLM", vlm_conf_map.get("賣方公司名稱"))
                     elif field == "營業稅稅別判斷":
                         # ✅ VLM 回傳的稅別字串（"應稅"/"零稅率"/"免稅"/null）解析為 tax_type/tax_found
                         VALID_TAX_TYPES = ["應稅", "零稅率", "免稅"]
@@ -2210,6 +2390,7 @@ for i, page in enumerate(pages):
                         if vlm_tax in VALID_TAX_TYPES:
                             tax_type  = vlm_tax
                             tax_found = True
+                            set_field_meta("營業稅稅別判斷", tax_type, "VLM", vlm_conf_map.get("營業稅稅別判斷"))
                             print(f"[VLM保底] 稅別更新：{tax_type}（已勾選）")
                             # 重新計算稅額/合計標準答案
                             if std_sales_amount is not None:
@@ -2222,9 +2403,11 @@ for i, page in enumerate(pages):
                             print(f"[VLM保底] 稅別仍未找到（回傳：{val}）")
                     elif field == "發票日期":
                         invoice_date = val
+                        set_field_meta("發票日期", val, "VLM", vlm_conf_map.get("發票日期"))
                         print(f"[LLM重試] 發票日期更新：{invoice_date}")
                     else:
                         llm_fields[field] = val
+                        set_field_meta(field, val, "VLM", vlm_conf_map.get(field))
                         if field == "明細項目":
                             vlm_detail_updated = True
 
@@ -2326,12 +2509,21 @@ for i, page in enumerate(pages):
                 for field, summary in v.get("欄位摘要", {}).items()
                 if isinstance(summary, dict)
             }
-            print(f"  {k}: {{'OCR結果': {detail_ocr_summary}}}")
+            conf = format_confidence(field_confidence.get(k))
+            src = field_source.get(k, "未知")
+            print(f"  {k}: {{'OCR結果': {detail_ocr_summary}, '信心值': '{conf}', '來源': '{src}'}}")
+            # print(f"  {k}: {{'OCR結果': {detail_ocr_summary}, '信心值': '{conf}'}}")
         elif isinstance(v, dict):
             if "OCR結果" in v:
-                print(f"  {k}: {{'OCR結果': {repr(v.get('OCR結果'))}}}")
+                conf = format_confidence(field_confidence.get(k))
+                src = field_source.get(k, "未知")
+                print(f"  {k}: {{'OCR結果': {repr(v.get('OCR結果'))}, '信心值': '{conf}', '來源': '{src}'}}")
+                # print(f"  {k}: {{'OCR結果': {repr(v.get('OCR結果'))}, '信心值': '{conf}'}}")
             elif "結果" in v:
-                print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}}}")
+                conf = format_confidence(field_confidence.get(k))
+                src = field_source.get(k, "未知")
+                print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}, '信心值': '{conf}', '來源': '{src}'}}")
+                # print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}, '信心值': '{conf}'}}")
 
 
 

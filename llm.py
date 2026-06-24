@@ -18,6 +18,33 @@ client = OpenAI(
 )
 
 
+def _to_confidence_01(value):
+    """將模型回傳的信心值轉成 0~1 浮點數，失敗回傳 None。"""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        if 0.0 <= v <= 1.0:
+            return round(v, 4)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _normalize_field_confidence_map(raw_map, allowed_fields: list) -> dict:
+    """清洗欄位信心值，只保留允許欄位且數值在 0~1。"""
+    if not isinstance(raw_map, dict):
+        return {}
+
+    cleaned = {}
+    for f in allowed_fields:
+        if f in raw_map:
+            conf = _to_confidence_01(raw_map.get(f))
+            if conf is not None:
+                cleaned[f] = conf
+    return cleaned
+
+
 def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
     """
     將 OCR 文字丟給 LLM，擷取以下欄位：
@@ -83,7 +110,16 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
   "合計金額": "<純數字或null>",
   "明細項目": [
     {{"品名": "<值或null>", "數量": "<原始文字或null>", "單價": "<純數字或null>", "金額": "<純數字或null>"}}
-  ]
+    ],
+    "欄位信心值": {{
+        "年度期間": "<0~1或null>",
+        "發票日期": "<0~1或null>",
+        "金額大寫中文": "<0~1或null>",
+        "未稅金額": "<0~1或null>",
+        "稅額": "<0~1或null>",
+        "合計金額": "<0~1或null>",
+        "明細項目": "<0~1或null>"
+    }}
 }}
 
 OCR 文字如下：
@@ -139,6 +175,12 @@ OCR 文字如下：
             else:
                 result["明細項目"] = []
 
+            result["__field_confidence__"] = _normalize_field_confidence_map(
+                result.get("欄位信心值"),
+                ["年度期間", "發票日期", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目"]
+            )
+            result.pop("欄位信心值", None)
+
             result["raw_response"] = raw_text
             print(f"[LLM] 解析結果：{result}")
             return result
@@ -164,6 +206,7 @@ def _empty_llm_result() -> dict:
         "稅額":       None,
         "合計金額":    None,
         "明細項目":    [],
+        "__field_confidence__": {},
         "raw_response": None
     }
 
@@ -233,6 +276,9 @@ def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
         else:
             json_template[field] = "<值或null>"
 
+    # 要求模型同步回傳每欄位的主觀信心值（0~1）
+    json_template["欄位信心值"] = {field: "<0~1或null>" for field in failed_fields}
+
     prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x座標,y座標]文字內容」。
 請利用座標資訊輔助判斷版面結構：
 - Y座標相近的文字代表在同一行
@@ -286,6 +332,12 @@ OCR 文字如下：
                 for key in ["單價", "金額"]:
                     if item.get(key):
                         item[key] = str(item[key]).replace(",", "").strip()
+
+        result["__field_confidence__"] = _normalize_field_confidence_map(
+            result.get("欄位信心值"),
+            failed_fields
+        )
+        result.pop("欄位信心值", None)
 
         return result
 
@@ -416,7 +468,8 @@ def determine_tax_type_by_llm(ocr_text: str) -> dict:
 {{
   "稅別": "<應稅 或 零稅率 或 免稅 或 null>",
   "已勾選": <true 或 false>,
-  "判斷依據": "<簡短說明>"
+    "判斷依據": "<簡短說明>",
+    "信心值": "<0~1或null>"
 }}
 
 OCR 文字如下：
@@ -451,8 +504,9 @@ OCR 文字如下：
             print(f"⚠️  [LLM稅別判斷] 未知稅別 [{tax_type}]，視為未找到勾選")
             return {"稅別": None, "已勾選": False, "判斷依據": reason or f"未知稅別：{tax_type}"}
 
+        conf = _to_confidence_01(result.get("信心值"))
         print(f"[LLM稅別判斷] 結果：{tax_type}，已勾選={found}（{reason}）")
-        return {"稅別": tax_type, "已勾選": found, "判斷依據": reason}
+        return {"稅別": tax_type, "已勾選": found, "判斷依據": reason, "信心值": conf}
 
     except Exception as e:
         print(f"⚠️  [LLM稅別判斷] 失敗：{e}")

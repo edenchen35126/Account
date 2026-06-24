@@ -23,6 +23,30 @@ client = OpenAI(
     base_url=VLLM_LLM_API_BASE2
 )
 
+
+def _to_confidence_01(value):
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        if 0.0 <= v <= 1.0:
+            return round(v, 4)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _normalize_field_confidence_map(raw_map, allowed_fields: list) -> dict:
+    if not isinstance(raw_map, dict):
+        return {}
+    cleaned = {}
+    for f in allowed_fields:
+        if f in raw_map:
+            conf = _to_confidence_01(raw_map.get(f))
+            if conf is not None:
+                cleaned[f] = conf
+    return cleaned
+
 # =========================
 # 工具函式
 # =========================
@@ -104,6 +128,8 @@ def extract_fields_from_image_region(
         else:
             json_template[field] = "<值或null>"
 
+    json_template["欄位信心值"] = {field: "<0~1或null>" for field in failed_fields}
+
     instructions = "\n".join([
         field_instructions[f] for f in failed_fields if f in field_instructions
     ])
@@ -184,6 +210,12 @@ def extract_fields_from_image_region(
                         item[key] = str(item[key]).replace(",", "").strip()
             result["明細項目"] = items
 
+        result["__field_confidence__"] = _normalize_field_confidence_map(
+            result.get("欄位信心值"),
+            failed_fields
+        )
+        result.pop("欄位信心值", None)
+
         return result
 
     except json.JSONDecodeError as e:
@@ -220,7 +252,8 @@ def extract_invoice_number_from_image(image_pil: Image.Image, known_prefix: str 
 請只回傳 JSON，不要加任何說明：
 {{
   "發票號碼": "<2個英文字母+8個數字或null>",
-  "reason": "<簡短原因>"
+    "reason": "<簡短原因>",
+    "信心值": "<0~1或null>"
 }}"""
 
     try:
@@ -250,7 +283,8 @@ def extract_invoice_number_from_image(image_pil: Image.Image, known_prefix: str 
         result = json.loads(json_match.group())
         return {
             "發票號碼": result.get("發票號碼"),
-            "reason": result.get("reason", "")
+            "reason": result.get("reason", ""),
+            "__field_confidence__": {"發票號碼": _to_confidence_01(result.get("信心值"))} if _to_confidence_01(result.get("信心值")) is not None else {}
         }
 
     except Exception as e:
