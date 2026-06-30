@@ -2031,9 +2031,41 @@ for i, page in enumerate(pages):
                 failed.append(k)
         return failed
 
+    def expand_failed_fields_for_amount_retry(failed_fields: list, active_rules: list) -> list:
+        """
+        若未稅金額/稅額/合計金額任一失敗，代表明細金額可能有誤，
+        自動將「明細項目」加入重試欄位（含裁切截圖流程）。
+        """
+        expanded = list(failed_fields)
+        amount_failed_fields = [f for f in ["未稅金額", "稅額", "合計金額"] if f in expanded]
+        if amount_failed_fields and "明細項目" in active_rules and "明細項目" not in expanded:
+            expanded.append("明細項目")
+            print(f"[重試欄位擴展] {amount_failed_fields}失敗，追加重試欄位：明細項目（重點重抓金額）")
+        return expanded
+
     def expand_vlm_crop_bbox_for_fields(bbox_result: dict, fields: list, image_size: tuple[int, int]) -> list:
         """針對特定欄位微調 VLM 裁切範圍，避免欄位內容被切掉。"""
         page_w, page_h = image_size
+
+        # 明細金額若要和未稅/稅額/合計一起重試，裁切區域需同時涵蓋明細區與下方金額區。
+        if "明細項目" in fields and any(f in fields for f in ["未稅金額", "稅額", "合計金額"]):
+            return [
+                int(page_w * 0.10),
+                int(page_h * 0.22),
+                int(page_w * 0.82),
+                int(page_h * 0.78),
+            ]
+
+        if fields == ["賣方統編"]:
+            # 賣方統編通常在下半部（營業人章/負責人/TEL/地址附近），
+            # 強制用下半部 ROI，避免誤裁到上方買方統編區。
+            return [
+                int(page_w * 0.45),
+                int(page_h * 0.48),
+                page_w,
+                page_h,
+            ]
+
         x1 = int(bbox_result["x1"])
         y1 = int(bbox_result["y1"])
         x2 = int(bbox_result["x2"])
@@ -2151,6 +2183,7 @@ for i, page in enumerate(pages):
     for retry_attempt in range(MAX_FIELD_RETRY):
 
         failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+        failed_fields = expand_failed_fields_for_amount_retry(failed_fields, prefix_rule["rules"])
         if not failed_fields:
             print(f"✅ 所有欄位比對通過，不需重試")
             break
@@ -2263,6 +2296,7 @@ for i, page in enumerate(pages):
         )
 
         still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+        still_failed = expand_failed_fields_for_amount_retry(still_failed, prefix_rule["rules"])
         if still_failed:
             print(f"[LLM重試] 第{retry_attempt+1}次後仍失敗：{still_failed}")
         else:
@@ -2272,6 +2306,7 @@ for i, page in enumerate(pages):
     # ✅ VLM 保底（LLM 重試後仍失敗）
     VLM_MAX_RETRY        = 2
     final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+    final_failed_fields = expand_failed_fields_for_amount_retry(final_failed_fields, prefix_rule["rules"])
     if final_failed_fields:
         # 稅別獨立重試，避免在多欄位 VLM 擷取時互相干擾
         if "營業稅稅別判斷" in final_failed_fields:
@@ -2305,6 +2340,7 @@ for i, page in enumerate(pages):
                 std_total_amount=std_total_amount
             )
             final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+            final_failed_fields = expand_failed_fields_for_amount_retry(final_failed_fields, prefix_rule["rules"])
 
         print(f"\n[VLM保底] LLM重試{MAX_FIELD_RETRY}次仍失敗：{final_failed_fields}")
         print(f"[VLM保底] 改用 VLM 圖片理解，最多重試 {VLM_MAX_RETRY} 次...")
@@ -2452,6 +2488,7 @@ for i, page in enumerate(pages):
                 )
 
                 vlm_still_failed = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
+                vlm_still_failed = expand_failed_fields_for_amount_retry(vlm_still_failed, prefix_rule["rules"])
 
                 if not vlm_still_failed:
                     print(f"[VLM保底] 第{vlm_attempt}次比對通過 ✅")
