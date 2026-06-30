@@ -13,7 +13,11 @@ from PIL import Image, ImageDraw, ImageFont  , ImageEnhance, ImageFilter # 圖�
 import pandas as pd                      # Excel 讀取
 
 # ✅ 引入 VLM 判斷函式
-from vlm import detect_multi_invoice, extract_fields_from_image_region, crop_image_region, detect_total_ntd_text, extract_invoice_number_from_image
+from vlm import (
+    detect_multi_invoice, extract_fields_from_image_region, crop_image_region,
+    detect_total_ntd_text, extract_invoice_number_from_image,
+    verify_company_existence_by_model,   # ✅ 新增
+)
 # ✅ 引入 LLM 擷取函式
 from llm import (
     extract_invoice_fields_by_llm,
@@ -381,7 +385,7 @@ def compare_detail_items_has_value(ocr_items: list, active_detail_fields: list =
 def build_ocr_text_with_position(ocr_items: list) -> str:
     """
     將 OCR 結果轉成帶位置資訊的文字，傳給 LLM 輔助判斷
-    格式：[x座標,y座標] 文字內容
+    格式：[x1,y1,x2,y2] 文字內容（bbox 外接矩形）
     同一行（Y 座標相近）的文字會排在同一行
     """
     if not ocr_items:
@@ -412,8 +416,8 @@ def build_ocr_text_with_position(ocr_items: list) -> str:
     for line in lines:
         line_parts = []
         for item in line:
-            x1, y1 = item["bbox"][0], item["bbox"][1]
-            line_parts.append(f"[{x1},{y1}]{item['text']}")
+            x1, y1, x2, y2 = item["bbox"]
+            line_parts.append(f"[{x1},{y1},{x2},{y2}]{item['text']}")
         result_lines.append("  ".join(line_parts))
 
     return "\n".join(result_lines)
@@ -1783,6 +1787,7 @@ for i, page in enumerate(pages):
             field_confidence[field_name] = estimate_field_confidence(
                 ocr_items, field_name, field_value, source_name
             )
+    
 
     # --- 圖片轉換與儲存 ---
     img = np.array(page)
@@ -2416,9 +2421,25 @@ for i, page in enumerate(pages):
                     elif field == "買方公司名稱":
                         buyer_company_name = val
                         set_field_meta("買方公司名稱", val, "VLM", vlm_conf_map.get("買方公司名稱"))
+                    # elif field == "賣方公司名稱":
+                    #     seller_company_name = val
+                    #     set_field_meta("賣方公司名稱", val, "VLM", vlm_conf_map.get("賣方公司名稱"))
                     elif field == "賣方公司名稱":
-                        seller_company_name = val
-                        set_field_meta("賣方公司名稱", val, "VLM", vlm_conf_map.get("賣方公司名稱"))
+                        val_str = str(val).strip() if val is not None else ""
+
+                        if val_str.lower() in ["", "null", "none", "未找到"]:
+                            seller_company_name = None
+                        elif vlm_attempt == 1:
+                            verdict = verify_company_existence_by_model(val_str)
+                            if verdict.get("exists") is True:
+                                seller_company_name = val_str
+                                set_field_meta("賣方公司名稱", val_str, "VLM", vlm_conf_map.get("賣方公司名稱"))
+                            else:
+                                print(f"⚠️  [公司存在性檢查][VLM第1次] '{val_str}' 不存在或不確定（{verdict}），先視為失敗以觸發後續裁切重抓")
+                                seller_company_name = None
+                        else:
+                            seller_company_name = val_str
+                            set_field_meta("賣方公司名稱", val_str, "VLM", vlm_conf_map.get("賣方公司名稱"))
                     elif field == "營業稅稅別判斷":
                         # ✅ VLM 回傳的稅別字串（"應稅"/"零稅率"/"免稅"/null）解析為 tax_type/tax_found
                         VALID_TAX_TYPES = ["應稅", "零稅率", "免稅"]

@@ -68,6 +68,95 @@ def image_to_base64(image_pil: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+# =========================
+# 公司存在性（用模型做保守判斷）
+# =========================
+
+_company_existence_cache: dict[str, dict] = {}
+
+def _normalize_company_name_for_check(name: str) -> str:
+    if not name:
+        return ""
+    s = re.sub(r"\s+", "", str(name))
+    s = s.replace("臺", "台")
+    return s
+
+def verify_company_existence_by_model(company_name: str) -> dict:
+    """
+    用模型做「保守」存在性/可疑性判斷：
+    - true  : 很有把握存在/合理（通常很少）
+    - false : 明顯不像公司名/明顯錯
+    - null  : 無法確定（不要猜）
+    回傳: {"exists": True/False/None, "reason": "..."}
+    """
+    name = (company_name or "").strip()
+    if not name:
+        return {"exists": None, "reason": "empty"}
+
+    key = _normalize_company_name_for_check(name)
+    if key in _company_existence_cache:
+        return _company_existence_cache[key]
+
+    prompt = f"""
+請只根據公司名稱字面是否合理，做保守判斷。
+
+規則：
+- 若名稱包含明顯 OCR 雜訊/符號，或不像台灣公司名稱 → exists=false
+- 若名稱看起來合理，但你無法確定真實存在 → exists=null（不要猜）
+- 只有在你非常確定是明確存在且常見的公司時 → exists=true（通常很少）
+
+公司名稱：{name}
+
+請只回傳 JSON，不要加任何說明：
+{{
+  "exists": true 或 false 或 null,
+  "reason": "一句話原因"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model=VLLM_LLM_MODEL2,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=128,
+            temperature=0.0
+        )
+        content = (response.choices[0].message.content or "").strip()
+
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            result = {"exists": None, "reason": "non-json"}
+            _company_existence_cache[key] = result
+            return result
+
+        raw = json.loads(json_match.group())
+        exists = raw.get("exists")
+
+        # 兼容模型可能回 "null"/"true"/"false" 字串
+        if isinstance(exists, str):
+            low = exists.strip().lower()
+            if low == "true":
+                exists = True
+            elif low == "false":
+                exists = False
+            else:
+                exists = None
+        elif exists is True:
+            exists = True
+        elif exists is False:
+            exists = False
+        else:
+            exists = None
+
+        result = {"exists": exists, "reason": str(raw.get("reason", "")).strip()}
+        _company_existence_cache[key] = result
+        return result
+
+    except Exception as e:
+        result = {"exists": None, "reason": f"exception: {e}"}
+        _company_existence_cache[key] = result
+        return result
+
+
 def extract_fields_from_image_region(
     image_pil: Image.Image,
     failed_fields: list

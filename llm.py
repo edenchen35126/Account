@@ -61,7 +61,7 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
         dict: 擷取結果
     """
 
-    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x座標,y座標]文字內容」。
+    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x1,y1,x2,y2]文字內容」，其中 [x1,y1,x2,y2] 是文字的外接矩形座標。
 請利用座標資訊輔助判斷版面結構：
 - Y座標相近的文字代表在同一行
 - X座標較小的文字在左邊，X座標較大的文字在右邊
@@ -295,7 +295,7 @@ def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
     # 要求模型同步回傳每欄位的主觀信心值（0~1）
     json_template["欄位信心值"] = {field: "<0~1或null>" for field in failed_fields}
 
-    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x座標,y座標]文字內容」。
+    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x1,y1,x2,y2]文字內容」，其中 [x1,y1,x2,y2] 是文字的外接矩形座標。
 請利用座標資訊輔助判斷版面結構：
 - Y座標相近的文字代表在同一行
 - X座標較小在左，X座標較大在右
@@ -379,10 +379,29 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
         "稅額":       "稅額數字所在區域",
         "合計金額":    "合計金額數字所在區域",
         "發票號碼":    "發票號碼（英文+數字）所在區域",
-        "買方公司名稱": "買方公司名稱所在區域",
-        "賣方公司名稱": "賣方公司名稱所在區域",
-        "買方統編":    "買方統一編號（8位數字）所在區域",
-        "賣方統編":    "賣方統一編號（8位數字）所在區域",
+        # "買方公司名稱": "買方公司名稱所在區域",
+        # "賣方公司名稱": "賣方公司名稱所在區域",
+        # "買方統編":    "買方統一編號（8位數字）所在區域",
+        # "賣方統編":    "賣方統一編號（8位數字）所在區域",
+        "賣方統編":    """- 賣方統一編號（8位數字）所在區域
+            - 請優先參考 Y 座標位置：賣方資訊通常位於發票底部、賣方章戳附近、或賣方公司名稱附近""",
+        "買方統編":    """- 買方統一編號（8位數字）所在區域
+            - 通常在「買方」或「買」字附近，可能因換行與公司名稱分開""",
+        "買方公司名稱": """- 買方公司名稱所在區域
+            - 通常在「買方」或「方:」後面，可能因換行被切斷，請還原完整名稱""",
+        "賣方公司名稱": """- 賣方公司名稱所在區域
+            - 只能從「賣方資訊區」擷取，不可從買方欄位推測或補值
+            - 賣方資訊區通常位於：
+                1. 發票底部
+                2. 「營業人蓋用統一發票專用章」附近
+                3. 賣方章戳附近
+                4. 賣方統一編號附近
+            - 若同一張發票同時出現買方公司名稱與賣方公司名稱，請依 Y 座標與鄰近文字判斷：
+                - 買方公司名稱通常靠近「買受人」、「買方」、「統一編號」等買方欄位
+                - 賣方公司名稱通常靠近底部章戳、賣方統編、發票專用章
+            - 嚴格禁止將「買方公司名稱」填入「賣方公司名稱」
+            - 嚴格禁止因為賣方公司名稱辨識不完整，就使用買方公司名稱補上
+            - 不可根據常識、公司名稱完整度、買方名稱或上下文自行推測賣方公司名稱""",
         "營業稅稅別判斷": "營業稅稅別勾選區域（應稅/零稅率/免稅）",
     }
 
@@ -399,7 +418,7 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
 - 若同時看到買方統編與賣方統編，請優先回傳靠近頁面下半部的賣方統編區域。
 """
 
-    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x座標,y座標]文字內容」。
+    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x1,y1,x2,y2]文字內容」，其中 [x1,y1,x2,y2] 是文字的外接矩形座標。
 
 請判斷下列欄位在圖片中的位置，回傳一個能完整涵蓋所有欄位的矩形區域（bounding box）：
 
@@ -409,7 +428,10 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
 {seller_tax_hint}
 
 重要注意事項：
-- OCR 座標只標記文字的起始位置，實際內容（尤其是表格右側欄位）可能延伸更遠
+- ✅ 禁止把「買受人/買方」區塊的公司名稱當作「賣方公司名稱」。
+    - 例如：「買受人：」「買方：」「統一編號：」(上半部) 附近的公司名多半是買方。
+    - 若 OCR 同時出現「買方統編 05637971」與其他 8 碼統編，通常 05637971 為買方；賣方請以另一組統編附近的章戳/營業人專用章區域為主。
+- ✅ 若「賣方公司名稱」辨識不完整（例如只出現「…股份有限公」），寧可以賣方統編+章戳/營業人專用章附近區域為主，不要去抓買方公司名稱來補。
 - 請在找到的座標範圍基礎上，四個方向各額外擴展約 200 像素的安全邊界
 - 寧可框大一點，也不要切到內容
 
@@ -452,6 +474,46 @@ OCR 文字如下：
             if key in result:
                 result[key] = int(result[key])
 
+        def _parse_ocr_position_items(raw: str) -> list[dict]:
+            """Parse lines like: [x1,y1,x2,y2]text  [x1,y1,x2,y2]text ..."""
+            items = []
+            if not raw:
+                return items
+            pattern = re.compile(r"\[(\d+),(\d+),(\d+),(\d+)\]([^\[]+)")
+            for m in pattern.finditer(raw):
+                x1, y1, x2, y2 = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+                text = m.group(5).strip()
+                items.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "text": text})
+            return items
+
+        # 估算頁面寬高（OCR bbox 的最大 x2/y2）
+        ocr_items = _parse_ocr_position_items(ocr_text_with_position)
+        page_w_est = max((it["x2"] for it in ocr_items), default=0)
+        page_h_est = max((it["y2"] for it in ocr_items), default=0)
+
+        # 若 bbox 明顯被「買方公司名稱」誤導而過度往左擴張，用賣方統編(8碼)當錨點收斂 x1
+        BUYER_TAX_ID_FIXED = "05637971"
+        if page_w_est > 0 and ("賣方統編" in failed_fields or "賣方公司名稱" in failed_fields):
+            candidates = []
+            for it in ocr_items:
+                digits = re.findall(r"\b\d{8}\b", it.get("text", ""))
+                for d in digits:
+                    if d == BUYER_TAX_ID_FIXED:
+                        continue
+                    candidates.append((it, d))
+
+            # 取最下方（y2 最大）的 8 碼作為賣方統編錨點（通常在章戳區）
+            if candidates:
+                anchor_it, anchor_digits = max(candidates, key=lambda t: t[0]["y2"])
+                # 只在「錨點在右側」且「模型框太靠左」時做收斂，避免誤傷左下版型
+                if anchor_it["x1"] >= int(page_w_est * 0.55) and result.get("x1", 0) <= int(page_w_est * 0.35):
+                    tighten_margin = int(page_w_est * 0.15)  # 約 15% 圖寬往左留白
+                    new_x1 = max(int(result.get("x1", 0)), max(0, anchor_it["x1"] - tighten_margin))
+                    if new_x1 > int(result.get("x1", 0)):
+                        result["x1"] = new_x1
+                        result["reason"] = (str(result.get("reason", "")).strip() +
+                                            f"（已用賣方統編候選 {anchor_digits} 的位置收斂左邊界）").strip()
+
         # ✅ 程式側再加一層保險擴展，以防 LLM 沒有確實擴展
         EXTRA_MARGIN = 150
         result["x1"] = max(0, result.get("x1", 0) - EXTRA_MARGIN)
@@ -480,7 +542,7 @@ def determine_tax_type_by_llm(ocr_text: str) -> dict:
           "判斷依據": "..."
         }
     """
-    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x座標,y座標]文字內容」。
+    prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x1,y1,x2,y2]文字內容」，其中 [x1,y1,x2,y2] 是文字的外接矩形座標。
 
 請判斷這張發票上是否有勾選「應稅」、「零稅率」或「免稅」其中一項。
 
