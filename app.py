@@ -25,6 +25,7 @@ from llm import (
     locate_field_region_by_llm,
     determine_tax_type_by_llm,
     compare_chinese_amount_meaning_by_llm,
+    verify_seller_name_matches_tax_id,
 )
 
 
@@ -55,7 +56,7 @@ INPUT_PATH   = config["input_path"]
 EXCEL_PATH   = config["excel_path"]
 POPPLER_PATH = config["poppler_path"]
 FONT_PATH    = config["font_path"]
-DPI          = config.get("dpi", 1000)
+DPI          = config.get("dpi", 1500)
 PDF_PATH     = config["pdf_path"]
 PDF_NAME     = config["pdf_name"]
 
@@ -1863,6 +1864,17 @@ for i, page in enumerate(pages):
     buyer_company_name = extract_buyer_company_name(page_text_clean)
     seller_company_name = extract_seller_company_name(page_text_clean)
 
+    # ✅ OCR 擷取到賣方公司名稱後也做「存在性」保守檢查：
+    # 只有 exists=True 才保留，其餘（false / null）一律視為失敗並清空。
+    val_str = str(seller_company_name or "").strip()
+    if val_str and val_str.lower() not in ["null", "none", "未找到"]:
+        verdict = verify_company_existence_by_model(val_str)
+        if verdict.get("exists") is True:
+            seller_company_name = val_str
+        else:
+            print(f"⚠️  [公司存在性檢查][OCR] '{val_str}' 不存在或不確定（{verdict}），視為 None")
+            seller_company_name = None
+
     validation_result = {}
     validation_result["買方統一編號"]          = buyer_tax_id
     validation_result["買方公司名稱"]          = buyer_company_name
@@ -1934,10 +1946,33 @@ for i, page in enumerate(pages):
             print(f"⚠️  [前綴補救][LLM] 仍無法取得可用發票號碼")
 
     if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
+        # print(f"⚠️  發票前綴仍無法使用，改用 VLM 圖片理解重新擷取發票號碼")
+        # vlm_invoice_retry = extract_fields_from_image_region(page, ["發票號碼"])
+        # vlm_invoice_conf_map = vlm_invoice_retry.get("__field_confidence__", {}) if vlm_invoice_retry else {}
+        # vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
         print(f"⚠️  發票前綴仍無法使用，改用 VLM 圖片理解重新擷取發票號碼")
-        vlm_invoice_retry = extract_fields_from_image_region(page, ["發票號碼"])
-        vlm_invoice_conf_map = vlm_invoice_retry.get("__field_confidence__", {}) if vlm_invoice_retry else {}
-        vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
+
+        # ✅ 新增：先用 LLM 根據 OCR 座標文字定位發票號碼區域，裁切後再辨識
+        vlm_invoice_no = None
+        vlm_invoice_conf_map = {}
+        bbox_result = locate_field_region_by_llm(ocr_text_with_position, ["發票號碼"])
+        if bbox_result and all(k in bbox_result for k in ["x1", "y1", "x2", "y2"]):
+            invoice_no_crop = crop_image_region(
+                page,
+                [bbox_result["x1"], bbox_result["y1"], bbox_result["x2"], bbox_result["y2"]],
+                padding=30
+            )
+            os.makedirs("vlm_crop_debug", exist_ok=True)
+            invoice_no_crop_path = f"vlm_crop_debug/page{i+1}_invoice_no_llm_located.png"
+            invoice_no_crop.save(invoice_no_crop_path)
+            print(f"[前綴補救][LLM定位+VLM] 發票號碼裁切圖片已儲存：{invoice_no_crop_path}，"
+                  f"bbox=[{bbox_result['x1']}, {bbox_result['y1']}, {bbox_result['x2']}, {bbox_result['y2']}]，"
+                  f"尺寸：{invoice_no_crop.size}")
+            vlm_invoice_retry = extract_invoice_number_from_image(invoice_no_crop)
+            vlm_invoice_conf_map = vlm_invoice_retry.get("__field_confidence__", {}) if vlm_invoice_retry else {}
+            vlm_invoice_no = clean_invoice_no_candidate(vlm_invoice_retry.get("發票號碼") if vlm_invoice_retry else None)
+        else:
+            print(f"⚠️  [前綴補救][LLM定位] 無法取得發票號碼區域座標")
 
         if not vlm_invoice_no:
             print(f"⚠️  [前綴補救][VLM] 整張圖仍無法取得發票號碼，改裁切上方字軌區重試")
@@ -2250,8 +2285,17 @@ for i, page in enumerate(pages):
                         buyer_company_name = val
                         set_field_meta("買方公司名稱", val, "LLM", retry_conf_map.get("買方公司名稱"))
                     elif field == "賣方公司名稱":
-                        seller_company_name = val
-                        set_field_meta("賣方公司名稱", val, "LLM", retry_conf_map.get("賣方公司名稱"))
+                        val_str = str(val or "").strip()
+                        if not val_str or val_str.lower() in ["null", "none", "未找到"]:
+                            seller_company_name = None
+                        else:
+                            verdict = verify_company_existence_by_model(val_str)
+                            if verdict.get("exists") is True:
+                                seller_company_name = val_str
+                                set_field_meta("賣方公司名稱", val_str, "LLM", retry_conf_map.get("賣方公司名稱"))
+                            else:
+                                print(f"⚠️  [公司存在性檢查][LLM] '{val_str}' 不存在或不確定（{verdict}），視為 None")
+                                seller_company_name = None
                     elif field == "發票日期":
                         invoice_date = val
                         set_field_meta("發票日期", val, "LLM", retry_conf_map.get("發票日期"))
@@ -2524,6 +2568,57 @@ for i, page in enumerate(pages):
                     # ✅ 下一輪只針對仍失敗的欄位
                     vlm_current_fields = vlm_still_failed
                     print(f"[VLM保底] 下一次只針對失敗欄位重試：{vlm_current_fields}")
+
+
+    # ✅ VLM 第3次：賣方公司名稱與統一編號交叉驗證
+    # 當兩者都有值時，請 LLM 確認是否對應同一家公司；若確認不符則清空名稱並重抓
+    if seller_company_name and seller_tax_id:
+        seller_verify = verify_seller_name_matches_tax_id(seller_company_name, seller_tax_id)
+        if seller_verify.get("match") is False or seller_verify.get("match") is None:
+            print(f"[VLM第3次] 賣方公司名稱 '{seller_company_name}' 與統編 '{seller_tax_id}' 不符（{seller_verify.get('reason')}），清空後重抓")
+            seller_company_name = None
+            # 重新定位並裁切賣方公司名稱區域
+            bbox_result_3 = locate_field_region_by_llm(ocr_text_with_position, ["賣方公司名稱"])
+            if bbox_result_3 and all(k in bbox_result_3 for k in ["x1", "y1", "x2", "y2"]):
+                crop_bbox_3 = expand_vlm_crop_bbox_for_fields(bbox_result_3, ["賣方公司名稱"], page.size)
+                cropped_3 = crop_image_region(page, crop_bbox_3, padding=0)
+                os.makedirs("vlm_crop_debug", exist_ok=True)
+                crop_save_3 = f"vlm_crop_debug/page{i+1}_attempt3_賣方公司名稱.png"
+                cropped_3.save(crop_save_3)
+                print(f"[VLM第3次] 裁切圖片已儲存：{crop_save_3}，bbox={crop_bbox_3}")
+                vlm_input_3 = cropped_3
+            else:
+                print("[VLM第3次] LLM 定位失敗，改用整張圖")
+                vlm_input_3 = page
+
+            vlm_result_3 = extract_fields_from_image_region(vlm_input_3, ["賣方公司名稱"])
+            vlm_conf_map_3 = vlm_result_3.get("__field_confidence__", {}) if vlm_result_3 else {}
+            val_3 = (vlm_result_3 or {}).get("賣方公司名稱")
+            val_str_3 = str(val_3).strip() if val_3 else ""
+
+            if val_str_3 and val_str_3.lower() not in ["", "null", "none", "未找到"]:
+                seller_company_name = val_str_3
+                set_field_meta("賣方公司名稱", val_str_3, "VLM", vlm_conf_map_3.get("賣方公司名稱"))
+                print(f"[VLM第3次] 賣方公司名稱更新：{seller_company_name}")
+            else:
+                print("[VLM第3次] 仍無法取得賣方公司名稱，維持 None")
+
+            # 第3次後重新比對
+            compare_result = compare_with_standard(
+                buyer_tax_id, seller_tax_id,
+                buyer_company_name, seller_company_name,
+                amount_validation, extracted_invoice_no,
+                standard, llm_fields,
+                active_rules=prefix_rule["rules"],
+                active_detail_fields=prefix_rule["detail_fields"],
+                tax_type=tax_type,
+                tax_found=tax_found,
+                std_sales_amount=std_sales_amount,
+                std_tax_amount=std_tax_amount,
+                std_total_amount=std_total_amount
+            )
+        else:
+            print(f"[VLM第3次] 賣方公司名稱與統編驗證通過（match={seller_verify.get('match')}），不需重抓")
 
 
     validation_result["與Excel比對結果"] = compare_result

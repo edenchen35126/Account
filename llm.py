@@ -7,6 +7,7 @@ from openai import OpenAI
 # =========================
 
 VLLM_LLM_MODEL = "gemma-4-26B-A4B-it"
+VLLM_LLM_MODEL_2 = "gpt-oss-120b"
 VLLM_LLM_API_BASE = "http://10.2.5.22:8190/v1"
 
 
@@ -249,7 +250,8 @@ def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
         "買方統編":    """- 買方統編（買方統一編號）：8位數字
    - 通常在「買方」或「買」字附近，可能因換行與公司名稱分開""",
         "賣方統編":    """- 賣方統編（賣方統一編號）：8位數字
-   - 請優先參考 Y 座標位置：賣方資訊通常位於發票底部、賣方章戳附近、或賣方公司名稱附近""",
+   - 請優先參考 Y 座標位置：賣方資訊通常位於發票底部、賣方章戳附近、或賣方公司名稱附近
+   - 注意：部分發票賣方統編會以「#」開頭並緊接在日期/時間戳記之後，例如「2026-05-04 16:38#23762748」，此時請擷取「#」後面的8位數字（23762748），輸出時不要包含「#」符號""",
         "買方公司名稱": """- 買方公司名稱：完整公司名稱
    - 通常在「買方」或「方:」後面，可能因換行被切斷，請還原完整名稱""",
    #   - 請優先參考 Y 座標位置：賣方資訊通常位於發票底部、賣方章戳附近 
@@ -600,6 +602,71 @@ OCR 文字如下：
     except Exception as e:
         print(f"⚠️  [LLM稅別判斷] 失敗：{e}")
         return {"稅別": None, "已勾選": False, "判斷依據": f"LLM呼叫失敗：{e}"}
+
+
+def verify_seller_name_matches_tax_id(company_name: str, tax_id: str) -> dict:
+    """
+    使用 LLM 判斷賣方公司名稱與統一編號是否對應同一家公司。
+
+    Args:
+        company_name: 賣方公司名稱
+        tax_id:       賣方統一編號（8位數字）
+    Returns:
+        dict: {
+          "match": True / False / None,  # None = 無法判斷
+          "reason": str
+        }
+    """
+    prompt = f"""請根據你的知識，判斷以下台灣公司名稱與統一編號是否對應同一家公司：
+
+公司名稱：{company_name}
+統一編號：{tax_id}
+
+判斷規則：
+- 如果你確認這個名稱與統一編號屬於同一家公司 → match: true
+- 如果你確認不符（例如統一編號對應的是另一家公司）→ match: false
+- 如果資訊不足，無法確認（例如公司太小眾或名稱明顯是 OCR 誤字）→ match: null
+
+請只回傳以下 JSON 格式，不要加任何說明：
+{{
+  "match": true 或 false 或 null,
+  "reason": "<簡短說明>"
+}}"""
+
+    try:
+        print(f"[LLM賣方驗證] 判斷公司名稱 '{company_name}' 與統編 '{tax_id}' 是否相符...")
+        response = client.chat.completions.create(
+            model=VLLM_LLM_MODEL_2,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=128,
+            temperature=0.0
+        )
+        content = (response.choices[0].message.content or "").strip()
+        print(f"[LLM賣方驗證] 回應：{content}")
+
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            print("⚠️  [LLM賣方驗證] 找不到 JSON，視為無法判斷")
+            return {"match": None, "reason": "LLM回應解析失敗"}
+
+        result = json.loads(json_match.group())
+        raw_match = result.get("match")
+
+        # 正規化：接受 true/false/null（JSON） 或字串 "true"/"false"
+        if raw_match is True:
+            match_val = True
+        elif raw_match is False:
+            match_val = False
+        else:
+            match_val = None
+
+        reason = result.get("reason", "")
+        print(f"[LLM賣方驗證] 結果：match={match_val}（{reason}）")
+        return {"match": match_val, "reason": reason}
+
+    except Exception as e:
+        print(f"⚠️  [LLM賣方驗證] 失敗：{e}")
+        return {"match": None, "reason": f"LLM呼叫失敗：{e}"}
 
 
 # =========================
