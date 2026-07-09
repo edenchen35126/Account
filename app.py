@@ -12,10 +12,13 @@ import re                                # 正則表達式
 from PIL import Image, ImageDraw, ImageFont  , ImageEnhance, ImageFilter # 圖片繪製與字型
 import pandas as pd                      # Excel 讀取
 
+from PIL import Image, ImageOps, ImageEnhance
+
 # ✅ 引入 VLM 判斷函式
 from vlm import (
     detect_multi_invoice, extract_fields_from_image_region, crop_image_region,
     detect_total_ntd_text, extract_invoice_number_from_image,
+    extract_tax_type_from_image,
     verify_company_existence_by_model,   # ✅ 新增
 )
 # ✅ 引入 LLM 擷取函式
@@ -1264,9 +1267,9 @@ def extract_fields_from_ocr_text(page_text_clean):
             page_text_clean, r'統一\s*編號', 8
         )
 
-    # ✅ Fallback：掃全文找發票號碼，允許中間有「-」，找到後清除「-」
+    # ✅ Fallback：掃全文找發票號碼，限定 2 碼英文 + 8 碼數字
     if extracted_data["發票號碼"] is None:
-        m = re.search(r'[A-Z]{2}-?\d{6,8}', page_text_clean)
+        m = re.search(r'[A-Z]{2}-?\d{8}', page_text_clean)
         if m:
             raw = m.group()
             cleaned = raw.replace("-", "").replace(" ", "")
@@ -1825,7 +1828,6 @@ for i, page in enumerate(pages):
     # 1. OCR branch：執行文字辨識
     # ---------------------------------
     ocr_items = run_ocr(jpg_path)
-    print(ocr_items)
 
     # 將所有辨識文字合併成純文字字串
     page_text       = "\n".join([item["text"] for item in ocr_items])
@@ -1837,6 +1839,13 @@ for i, page in enumerate(pages):
 
     # 從 OCR 文字擷取關鍵欄位
     extracted_data = extract_fields_from_ocr_text(page_text_clean)
+
+    # ✅ 發票號碼格式驗證：必須是 2 碼英文 + 8 碼數字
+    _inv_no_raw = extracted_data.get("發票號碼")
+    if _inv_no_raw:
+        if not re.fullmatch(r'[A-Za-z]{2}\d{8}', _inv_no_raw):
+            print(f"⚠️  發票號碼格式不符: '{_inv_no_raw}'（應為 2 碼英文 + 8 碼數字），清除並觸發 LLM/VLM 重抓")
+            extracted_data["發票號碼"] = None
 
     # ---------------------------------
     # 2. TSR branch：表格結構辨識
@@ -1916,18 +1925,19 @@ for i, page in enumerate(pages):
     ocr_text_with_position = build_ocr_text_with_position(ocr_items)
 
     def clean_invoice_no_candidate(value):
-        """清理 LLM/VLM 回傳的發票號碼候選值"""
+        """清理 LLM/VLM 回傳的發票號碼候選值，並驗證格式為 2 碼英文 + 8 碼數字"""
         if value is None:
             return None
         cleaned = re.sub(r'[^A-Za-z0-9]', '', str(value)).upper()
         if cleaned in ["", "NULL", "NONE", "未找到"]:
             return None
-        return cleaned if re.fullmatch(r'[A-Z]{2}\d{6,8}', cleaned) else None
+        if re.fullmatch(r'[A-Z]{2}\d{8}', cleaned):
+            return cleaned
+        print(f"⚠️  LLM/VLM 發票號碼格式不符: '{cleaned}'（應為 2 碼英文 + 8 碼數字）")
+        return None
 
     # ✅ 依發票前兩碼決定檢核規則
     prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
-    print(f"\n  發票前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
-
     # ✅ 發票前綴找不到/未設定時：先用 LLM 補抓發票號碼，再用 VLM 保底
     if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
         print(f"⚠️  發票前綴無法使用，先改用 LLM 重新擷取發票號碼")
@@ -2088,7 +2098,10 @@ for i, page in enumerate(pages):
         page_w, page_h = image_size
 
         # 明細金額若要和未稅/稅額/合計一起重試，裁切區域需同時涵蓋明細區與下方金額區。
-        if "明細項目" in fields and any(f in fields for f in ["未稅金額", "稅額", "合計金額"]):
+        # 但若同時包含賣方公司名稱，賣方區可能在頁面頂部，不可用硬編碼的中領區域。
+        if "明細項目" in fields \
+                and any(f in fields for f in ["未稅金額", "稅額", "合計金額"]) \
+                and "賣方公司名稱" not in fields:
             return [
                 int(page_w * 0.10),
                 int(page_h * 0.22),
@@ -2155,6 +2168,36 @@ for i, page in enumerate(pages):
         tax_type = tax_result.get("稅別")
         tax_found = tax_result.get("已勾選", False)
         set_field_meta("營業稅稅別判斷", tax_type, "LLM", tax_result.get("信心值"))
+
+        # ✅ LLM 也找不到時：用 LLM 定位稅別區塊 → 裁切 → VLM 聚焦辨識
+        if tax_type not in VALID_TAX_TYPES:
+            print(f"⚠️  [稅別補救] LLM OCR 仍無法判斷，改用 LLM 定位稅別區塊後裁切 VLM 辨識")
+            tax_bbox = locate_field_region_by_llm(ocr_text_with_position, ["營業稅稅別判斷"])
+            if tax_bbox and all(k in tax_bbox for k in ["x1", "y1", "x2", "y2"]):
+                tax_crop = crop_image_region(
+                    page,
+                    [tax_bbox["x1"], tax_bbox["y1"], tax_bbox["x2"], tax_bbox["y2"]],
+                    padding=30
+                )
+                os.makedirs("vlm_crop_debug", exist_ok=True)
+                tax_crop_path = f"vlm_crop_debug/page{i+1}_tax_type_llm_located.png"
+                tax_crop.save(tax_crop_path)
+                print(f"[稅別補救] 裁切圖片已儲存：{tax_crop_path}，"
+                      f"bbox=[{tax_bbox['x1']}, {tax_bbox['y1']}, {tax_bbox['x2']}, {tax_bbox['y2']}]，"
+                      f"尺寸：{tax_crop.size}")
+                vlm_tax_focused = extract_tax_type_from_image(tax_crop)
+                vlm_tax_focused_conf_map = vlm_tax_focused.get("__field_confidence__", {})
+                vlm_tax_focused_val = str(vlm_tax_focused.get("營業稅稅別判斷") or "").strip()
+                if vlm_tax_focused_val in VALID_TAX_TYPES:
+                    tax_type = vlm_tax_focused_val
+                    tax_found = True
+                    tax_result = {"稅別": tax_type, "已勾選": True, "判斷依據": "LLM定位+VLM裁切聚焦判斷稅別"}
+                    set_field_meta("營業稅稅別判斷", tax_type, "VLM", vlm_tax_focused_conf_map.get("營業稅稅別判斷"))
+                    print(f"[稅別補救][LLM定位+VLM] 稅別: {tax_type}")
+                else:
+                    print(f"⚠️  [稅別補救][LLM定位+VLM] 仍無法判斷（回傳: {vlm_tax_focused_val}）")
+            else:
+                print(f"⚠️  [稅別補救] LLM 無法定位稅別區塊座標")
 
     print(f"  稅別: {tax_type}，已勾選: {tax_found}，依據: {tax_result.get('判斷依據')}")
 
@@ -2354,6 +2397,8 @@ for i, page in enumerate(pages):
 
     # ✅ VLM 保底（LLM 重試後仍失敗）
     VLM_MAX_RETRY        = 2
+    vlm_still_failed     = []   # 初始化，保證後續判斷安全
+    _vlm2_seller_name_candidate = None  # VLM 第2次存在性檢查失敗時保留的候選値
     final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
     final_failed_fields = expand_failed_fields_for_amount_retry(final_failed_fields, prefix_rule["rules"])
     if final_failed_fields:
@@ -2419,7 +2464,7 @@ for i, page in enumerate(pages):
                         cropped = crop_image_region(
                             page,
                             crop_bbox,
-                            padding=0
+                            padding=200
                         )
                         vlm_input_image = cropped
 
@@ -2571,7 +2616,7 @@ for i, page in enumerate(pages):
 
 
     # ✅ VLM 第3次：賣方公司名稱與統一編號交叉驗證
-    # 當兩者都有值時，請 LLM 確認是否對應同一家公司；若確認不符則清空名稱並重抓
+  # 當兩者都有值時，請 LLM 確認是否對應同一家公司；若確認不符則清空名稱並重抓
     if seller_company_name and seller_tax_id:
         seller_verify = verify_seller_name_matches_tax_id(seller_company_name, seller_tax_id)
         if seller_verify.get("match") is False or seller_verify.get("match") is None:
@@ -2581,7 +2626,7 @@ for i, page in enumerate(pages):
             bbox_result_3 = locate_field_region_by_llm(ocr_text_with_position, ["賣方公司名稱"])
             if bbox_result_3 and all(k in bbox_result_3 for k in ["x1", "y1", "x2", "y2"]):
                 crop_bbox_3 = expand_vlm_crop_bbox_for_fields(bbox_result_3, ["賣方公司名稱"], page.size)
-                cropped_3 = crop_image_region(page, crop_bbox_3, padding=0)
+                cropped_3 = crop_image_region(page, crop_bbox_3, padding=100)
                 os.makedirs("vlm_crop_debug", exist_ok=True)
                 crop_save_3 = f"vlm_crop_debug/page{i+1}_attempt3_賣方公司名稱.png"
                 cropped_3.save(crop_save_3)
@@ -2619,6 +2664,7 @@ for i, page in enumerate(pages):
             )
         else:
             print(f"[VLM第3次] 賣方公司名稱與統編驗證通過（match={seller_verify.get('match')}），不需重抓")
+
 
 
     validation_result["與Excel比對結果"] = compare_result
@@ -2678,7 +2724,11 @@ for i, page in enumerate(pages):
                 print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}, '信心值': '{conf}', '來源': '{src}'}}")
                 # print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}, '信心值': '{conf}'}}")
 
-
+    print(f"  折讓單日期: {{'OCR結果': None, '信心值': None}}")
+    print(f"  備註: {{'OCR結果': None, '信心值': None}}")
+    multi_inv_result = detection.get("has_multiple_invoices", False)
+    multi_inv_conf   = detection.get("confidence")
+    print(f"  是否有多張發票: {{'OCR結果': {multi_inv_result}, '信心值': {repr(multi_inv_conf)}}}")
 
     print(f"\n第 {i+1} 頁 TSR cells 數量: {len(cells)}")
     print("-" * 50)
