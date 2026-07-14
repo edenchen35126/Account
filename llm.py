@@ -394,7 +394,9 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
         "買方統編":    """- 買方統一編號（8位數字）所在區域
             - 通常在「買方」或「買」字附近，可能因換行與公司名稱分開""",
         "買方公司名稱": """- 買方公司名稱所在區域
-            - 通常在「買方」或「方:」後面，可能因換行被切斷，請還原完整名稱""",
+            - 通常在「買方」或「方:」後面，可能因換行被切斷，請還原完整名稱
+            - 買方公司名稱通常靠近「買受人」、「買方」、「統一編號」等買方欄位
+            - 買方公司名稱包含抓到標題外，後面接的文字內容也需要含括在內""",
         "賣方公司名稱": """- 賣方公司名稱所在區域
             - 只能從「賣方資訊區」擷取，不可從買方欄位推測或補值
             - 賣方資訊區通常位於：
@@ -438,15 +440,19 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
     - 例如：「買受人：」「買方：」「統一編號：」(上半部) 附近的公司名多半是買方。
     - 若 OCR 同時出現「買方統編 05637971」與其他 8 碼統編，通常 05637971 為買方；賣方請以另一組統編附近的章戳/營業人專用章區域為主。
 - ✅ 若「賣方公司名稱」辨識不完整（例如只出現「…股份有限公」），寧可以賣方統編+章戳/營業人專用章附近區域為主，不要去抓買方公司名稱來補。
-- 請在找到的座標範圍基礎上，四個方向各額外擴展約 200 像素的安全邊界
-- 寧可框大一點，也不要切到內容
 
-請回傳以下 JSON 格式（座標單位與 OCR 座標相同，已含安全邊界）：
+
+
+請回傳以下 JSON 格式。
+座標必須依據 OCR 文字的實際外接矩形範圍，
+不要自行增加安全邊界或額外擴張，
+後續程式會統一處理座標擴展：
+
 {{
-  "x1": <最左邊x座標 再往左擴200，整數>,
-  "y1": <最上方y座標 再往上擴200，整數>,
-  "x2": <最右邊x座標 再往右擴200，整數>,
-  "y2": <最下方y座標 再往下擴200，整數>,
+  "x1": <目標區域最左側座標，整數>,
+  "y1": <目標區域最上方座標，整數>,
+  "x2": <目標區域最右側座標，整數>,
+  "y2": <目標區域最下方座標，整數>,
   "reason": "<簡短說明判斷依據>"
 }}
 
@@ -461,7 +467,7 @@ OCR 文字如下：
         response = client.chat.completions.create(
             model=VLLM_LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=256,
+            max_tokens=2048,
             temperature=0.0
         )
 
@@ -497,9 +503,20 @@ OCR 文字如下：
         page_w_est = max((it["x2"] for it in ocr_items), default=0)
         page_h_est = max((it["y2"] for it in ocr_items), default=0)
 
+
+        SELLER_FIELDS = {"賣方統編", "賣方公司名稱"}
+
+        # 只有當 failed_fields 全部都是賣方相關欄位時，才允許用賣方統編錨點收斂 bbox
+        should_tighten_by_seller_anchor = (
+            page_w_est > 0
+            and bool(set(failed_fields) & SELLER_FIELDS)
+            and set(failed_fields).issubset(SELLER_FIELDS)
+        )
+
         # 若 bbox 明顯被「買方公司名稱」誤導而過度往左擴張，用賣方統編(8碼)當錨點收斂 x1
         BUYER_TAX_ID_FIXED = "05637971"
-        if page_w_est > 0 and ("賣方統編" in failed_fields or "賣方公司名稱" in failed_fields):
+        # if page_w_est > 0 and ("賣方統編" in failed_fields or "賣方公司名稱" in failed_fields):
+        if should_tighten_by_seller_anchor:
             candidates = []
             for it in ocr_items:
                 digits = re.findall(r"\b\d{8}\b", it.get("text", ""))
@@ -520,12 +537,87 @@ OCR 文字如下：
                         result["reason"] = (str(result.get("reason", "")).strip() +
                                             f"（已用賣方統編候選 {anchor_digits} 的位置收斂左邊界）").strip()
 
-        # ✅ 程式側再加一層保險擴展，以防 LLM 沒有確實擴展
-        EXTRA_MARGIN = 150
-        result["x1"] = max(0, result.get("x1", 0) - EXTRA_MARGIN)
-        result["y1"] = max(0, result.get("y1", 0) - EXTRA_MARGIN)
-        result["x2"] = result.get("x2", 0) + EXTRA_MARGIN
-        result["y2"] = result.get("y2", 0) + EXTRA_MARGIN
+        # ============================================================
+        # 根據失敗欄位決定 bounding box 擴展方式
+        #
+        # 1. 僅有「買方統編」：
+        #    - 左右各擴展 100 像素
+        #    - 上下不擴展
+        #
+        # 2. 其他欄位或多個欄位：
+        #    - 上下左右各擴展 200 像素
+        # ============================================================
+
+        only_buyer_tax_id = (
+            len(failed_fields) == 1
+            and failed_fields[0] == "買方統編"
+        )
+
+        only_buyer_name = (
+            len(failed_fields) == 1
+            and failed_fields[0] == "買方公司名稱"
+        )
+
+        if only_buyer_tax_id:
+            margin_left = 250
+            margin_right = 250
+            margin_top = 0
+            margin_bottom = 0
+
+        elif only_buyer_name:
+            # 買方公司名稱只向右擴展 500px
+            margin_left = 0
+            margin_right = 1000
+            margin_top = 100
+            margin_bottom = 100
+
+        else:
+            margin_left = 200
+            margin_right = 200
+            margin_top = 200
+            margin_bottom = 200
+
+        result["x1"] = max(
+            0,
+            result.get("x1", 0) - margin_left
+        )
+
+        result["y1"] = max(
+            0,
+            result.get("y1", 0) - margin_top
+        )
+
+        result["x2"] = result.get("x2", 0) + margin_right
+        result["y2"] = result.get("y2", 0) + margin_bottom
+
+        expanded_x2 = result.get("x2", 0) + margin_right
+        expanded_y2 = result.get("y2", 0) + margin_bottom
+
+        result["x2"] = (
+            min(page_w_est, expanded_x2)
+            if page_w_est > 0
+            else expanded_x2
+        )
+
+        result["y2"] = (
+            min(page_h_est, expanded_y2)
+            if page_h_est > 0
+            else expanded_y2
+        )
+
+        print(
+            f"[LLM區域定位] 欄位={failed_fields}，"
+            f"左擴展={margin_left}px，"
+            f"右擴展={margin_right}px，"
+            f"上擴展={margin_top}px，"
+            f"下擴展={margin_bottom}px"
+        )
+
+        print(
+            f"[LLM區域定位] 擴展後座標："
+            f"x1={result['x1']} y1={result['y1']} "
+            f"x2={result['x2']} y2={result['y2']}"
+        )
 
         print(f"[LLM區域定位] 擴展後座標：x1={result['x1']} y1={result['y1']} x2={result['x2']} y2={result['y2']}")
         return result
