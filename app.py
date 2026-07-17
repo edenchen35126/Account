@@ -14,6 +14,8 @@ import pandas as pd                      # Excel 讀取
 
 from PIL import Image, ImageOps, ImageEnhance
 
+from qwen_vlm import extract_fields_from_image_region_qwen
+
 # ✅ 引入 VLM 判斷函式
 from vlm import (
     detect_multi_invoice, extract_fields_from_image_region, crop_image_region,
@@ -1873,6 +1875,8 @@ for i, page in enumerate(pages):
     buyer_company_name = extract_buyer_company_name(page_text_clean)
     seller_company_name = extract_seller_company_name(page_text_clean)
 
+    seller_tax_id = None
+
     # ✅ OCR 擷取到賣方公司名稱後也做「存在性」保守檢查：
     # 只有 exists=True 才保留，其餘（false / null）一律視為失敗並清空。
     val_str = str(seller_company_name or "").strip()
@@ -1883,6 +1887,8 @@ for i, page in enumerate(pages):
         else:
             print(f"⚠️  [公司存在性檢查][OCR] '{val_str}' 不存在或不確定（{verdict}），視為 None")
             seller_company_name = None
+
+
 
     validation_result = {}
     validation_result["買方統一編號"]          = buyer_tax_id
@@ -1938,22 +1944,22 @@ for i, page in enumerate(pages):
 
     # ✅ 依發票前兩碼決定檢核規則
     prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
-    # ✅ 發票前綴找不到/未設定時：先用 LLM 補抓發票號碼，再用 VLM 保底
-    if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
-        print(f"⚠️  發票前綴無法使用，先改用 LLM 重新擷取發票號碼")
-        llm_invoice_retry = reextract_specific_fields(ocr_text_with_position, ["發票號碼"])
-        llm_invoice_conf_map = llm_invoice_retry.get("__field_confidence__", {}) if llm_invoice_retry else {}
-        llm_invoice_no = clean_invoice_no_candidate(llm_invoice_retry.get("發票號碼") if llm_invoice_retry else None)
+    # # ✅ 發票前綴找不到/未設定時：先用 LLM 補抓發票號碼，再用 VLM 保底
+    # if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
+    #     print(f"⚠️  發票前綴無法使用，先改用 LLM 重新擷取發票號碼")
+    #     llm_invoice_retry = reextract_specific_fields(ocr_text_with_position, ["發票號碼"])
+    #     llm_invoice_conf_map = llm_invoice_retry.get("__field_confidence__", {}) if llm_invoice_retry else {}
+    #     llm_invoice_no = clean_invoice_no_candidate(llm_invoice_retry.get("發票號碼") if llm_invoice_retry else None)
 
-        if llm_invoice_no:
-            extracted_invoice_no = llm_invoice_no
-            lookup_invoice_no    = llm_invoice_no
-            extracted_data["發票號碼"] = llm_invoice_no
-            set_field_meta("發票號碼", llm_invoice_no, "LLM", llm_invoice_conf_map.get("發票號碼"))
-            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
-            print(f"[前綴補救][LLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
-        else:
-            print(f"⚠️  [前綴補救][LLM] 仍無法取得可用發票號碼")
+    #     if llm_invoice_no:
+    #         extracted_invoice_no = llm_invoice_no
+    #         lookup_invoice_no    = llm_invoice_no
+    #         extracted_data["發票號碼"] = llm_invoice_no
+    #         set_field_meta("發票號碼", llm_invoice_no, "LLM", llm_invoice_conf_map.get("發票號碼"))
+    #         prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
+    #         print(f"[前綴補救][LLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
+    #     else:
+    #         print(f"⚠️  [前綴補救][LLM] 仍無法取得可用發票號碼")
 
     if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
         # print(f"⚠️  發票前綴仍無法使用，改用 VLM 圖片理解重新擷取發票號碼")
@@ -2043,6 +2049,13 @@ for i, page in enumerate(pages):
         r'\d{2,3}年\d{1,2}月\d{1,2}日',   # 民國：115年05月04日
         r'\d{4}-\d{1,2}-\d{1,2}',            # 西元：2026-05-04
         r'\d{4}/\d{1,2}/\d{1,2}',            # 西元：2026/05/04
+
+        r'\d{2,3}/\d{1,2}/\d{1,2}',         # 民國：115/05/06
+        r'\d{2,3}-\d{1,2}-\d{1,2}',         # 民國：115-05-06
+        r'\d{4}年\d{1,2}月\d{1,2}日',       # 西元：2026年05月04日
+
+        r'\d{2,3}\.\d{1,2}\.\d{1,2}',       # 民國：115.05.07
+        r'\d{4}\.\d{1,2}\.\d{1,2}',         # 西元：2026.05.07
     ]
     if invoice_date and not any(re.fullmatch(p, str(invoice_date).strip()) for p in _DATE_PATTERNS):
         print(f"⚠️  [格式驗證] 發票日期格式不符：'{invoice_date}'，清空並標記重辨識")
@@ -2097,7 +2110,7 @@ for i, page in enumerate(pages):
         自動將「明細項目」加入重試欄位（含裁切截圖流程）。
         """
         expanded = list(failed_fields)
-        amount_failed_fields = [f for f in ["未稅金額", "稅額", "合計金額"] if f in expanded]
+        amount_failed_fields = [f for f in ["未稅金額"] if f in expanded]
         if amount_failed_fields and "明細項目" in active_rules and "明細項目" not in expanded:
             expanded.append("明細項目")
             print(f"[重試欄位擴展] {amount_failed_fields}失敗，追加重試欄位：明細項目（重點重抓金額）")
@@ -2109,37 +2122,37 @@ for i, page in enumerate(pages):
 
         # 明細金額若要和未稅/稅額/合計一起重試，裁切區域需同時涵蓋明細區與下方金額區。
         # 但若同時包含賣方公司名稱，賣方區可能在頁面頂部，不可用硬編碼的中領區域。
-        if "明細項目" in fields \
-                and any(f in fields for f in ["未稅金額", "稅額", "合計金額"]) \
-                and "賣方公司名稱" not in fields:
-            return [
-                int(page_w * 0.10),
-                int(page_h * 0.22),
-                int(page_w * 0.82),
-                int(page_h * 0.78),
-            ]
+        # if "明細項目" in fields \
+        #         and any(f in fields for f in ["未稅金額", "稅額", "合計金額"]) \
+        #         and "賣方公司名稱" not in fields:
+        #     return [
+        #         int(page_w * 0.10),
+        #         int(page_h * 0.22),
+        #         int(page_w * 0.82),
+        #         int(page_h * 0.78),
+        #     ]
 
-        if fields == ["賣方統編"]:
-            # 賣方統編通常在下半部（營業人章/負責人/TEL/地址附近），
-            # 強制用下半部 ROI，避免誤裁到上方買方統編區。
-            return [
-                int(page_w * 0.45),
-                int(page_h * 0.48),
-                page_w,
-                page_h,
-            ]
+        # if fields == ["賣方統編"]:
+        #     # 賣方統編通常在下半部（營業人章/負責人/TEL/地址附近），
+        #     # 強制用下半部 ROI，避免誤裁到上方買方統編區。
+        #     return [
+        #         int(page_w * 0.45),
+        #         int(page_h * 0.48),
+        #         page_w,
+        #         page_h,
+        #     ]
 
         x1 = int(bbox_result["x1"])
         y1 = int(bbox_result["y1"])
         x2 = int(bbox_result["x2"])
         y2 = int(bbox_result["y2"])
 
-        if fields == ["買方統編"]:
-            # 統編 8 格通常由標籤右側水平延伸，定位容易只抓到左半邊。
-            x1 -= 120
-            y1 -= 120
-            x2 += 900
-            y2 += 180
+        # if fields == ["買方統編"]:
+        #     # 統編 8 格通常由標籤右側水平延伸，定位容易只抓到左半邊。
+        #     x1 -= 120
+        #     y1 -= 120
+        #     x2 += 900
+        #     y2 += 180
 
         return [
             max(0, x1),
@@ -2157,10 +2170,12 @@ for i, page in enumerate(pages):
     tax_found = False
     tax_result = {"稅別": None, "已勾選": False, "判斷依據": "尚未判斷"}
 
-    print("[VLM稅別判斷] 使用整張圖片，只判斷營業稅稅別...")
-    vlm_tax_result = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
-    vlm_tax_conf_map = vlm_tax_result.get("__field_confidence__", {}) if vlm_tax_result else {}
-    vlm_tax = str(vlm_tax_result.get("營業稅稅別判斷") or "").strip() if vlm_tax_result else ""
+    # print("[VLM稅別判斷] 使用整張圖片，只判斷營業稅稅別...")
+    # vlm_tax_result = extract_fields_from_image_region(page, ["營業稅稅別判斷"])
+    # vlm_tax_conf_map = vlm_tax_result.get("__field_confidence__", {}) if vlm_tax_result else {}
+    # vlm_tax = str(vlm_tax_result.get("營業稅稅別判斷") or "").strip() if vlm_tax_result else ""
+    vlm_tax_conf_map = {}
+    vlm_tax = None
 
     if vlm_tax in VALID_TAX_TYPES:
         tax_type = vlm_tax
@@ -2638,7 +2653,7 @@ for i, page in enumerate(pages):
                                     qty = float(qty_num_str)
                                 price = float(price_str)
                                 amt   = float(amt_str2)
-                                if abs(qty * price - amt) > 0.2:
+                                if abs(qty * price - amt) > 0.1:
                                     print(f"⚠️  [VLM保底] 明細 數量*單價≠金額: {qty_num_str}×{price_str}={qty * price:.2f}，金額={amt}，標記重抓")
                                     detail_qty_price_mismatch = True
                             except (ValueError, ZeroDivisionError):
@@ -2733,7 +2748,7 @@ for i, page in enumerate(pages):
             std_tax_amount=std_tax_amount,
             std_total_amount=std_total_amount
         )
-
+    
     elif seller_company_name and seller_tax_id:
         seller_verify = verify_seller_name_matches_tax_id(seller_company_name, seller_tax_id)
         if seller_verify.get("match") is False or seller_verify.get("match") is None:
@@ -2782,6 +2797,55 @@ for i, page in enumerate(pages):
         else:
             print(f"[VLM第3次] 賣方公司名稱與統編驗證通過（match={seller_verify.get('match')}），不需重抓")
 
+    # ✅ VLM 第3次：賣方統一編號與公司名稱交叉驗證
+    # 當兩者都有值時，請 LLM 確認是否對應同一家公司；若確認不符則將賣方統編列為失敗項目並重新裁切辨識
+    if seller_company_name and seller_tax_id:
+        seller_verify_taxid = verify_seller_name_matches_tax_id(seller_company_name, seller_tax_id)
+        if seller_verify_taxid.get("match") is False or seller_verify_taxid.get("match") is None:
+            print(f"[VLM第3次][賣方統編] 賣方統編 '{seller_tax_id}' 與公司名稱 '{seller_company_name}' 不符（{seller_verify_taxid.get('reason')}），列為失敗項目，重新裁切辨識...")
+            seller_tax_id = None
+            # 重新定位並裁切賣方統編區域
+            bbox_seller_taxid = locate_field_region_by_llm(ocr_text_with_position, ["賣方統編"])
+            if bbox_seller_taxid and all(k in bbox_seller_taxid for k in ["x1", "y1", "x2", "y2"]):
+                crop_bbox_seller_taxid = expand_vlm_crop_bbox_for_fields(bbox_seller_taxid, ["賣方統編"], page.size)
+                cropped_seller_taxid = crop_image_region(page, crop_bbox_seller_taxid, padding=0)
+                os.makedirs("vlm_crop_debug", exist_ok=True)
+                crop_save_seller_taxid = f"vlm_crop_debug/page{i+1}_attempt3_賣方統編.png"
+                cropped_seller_taxid.save(crop_save_seller_taxid)
+                print(f"[VLM第3次][賣方統編] 裁切圖片已儲存：{crop_save_seller_taxid}，bbox={crop_bbox_seller_taxid}")
+                vlm_input_seller_taxid = cropped_seller_taxid
+            else:
+                print("[VLM第3次][賣方統編] LLM 定位失敗，改用整張圖")
+                vlm_input_seller_taxid = page
+
+            vlm_result_seller_taxid = extract_fields_from_image_region(vlm_input_seller_taxid, ["賣方統編"])
+            vlm_conf_seller_taxid = vlm_result_seller_taxid.get("__field_confidence__", {}) if vlm_result_seller_taxid else {}
+            val_seller_taxid = (vlm_result_seller_taxid or {}).get("賣方統編")
+            val_str_seller_taxid = re.sub(r"[^0-9]", "", str(val_seller_taxid).strip()) if val_seller_taxid else ""
+
+            if val_str_seller_taxid:
+                seller_tax_id = val_str_seller_taxid
+                set_field_meta("賣方統編", val_str_seller_taxid, "VLM", vlm_conf_seller_taxid.get("賣方統編"))
+                print(f"[VLM第3次][賣方統編] 更新：{seller_tax_id}")
+            else:
+                print("[VLM第3次][賣方統編] 辨識結果為空，維持原值 None")
+
+            # 重新比對
+            compare_result = compare_with_standard(
+                buyer_tax_id, seller_tax_id,
+                buyer_company_name, seller_company_name,
+                amount_validation, extracted_invoice_no,
+                standard, llm_fields,
+                active_rules=prefix_rule["rules"],
+                active_detail_fields=prefix_rule["detail_fields"],
+                tax_type=tax_type,
+                tax_found=tax_found,
+                std_sales_amount=std_sales_amount,
+                std_tax_amount=std_tax_amount,
+                std_total_amount=std_total_amount
+            )
+        else:
+            print(f"[VLM第3次][賣方統編] 賣方統編與公司名稱驗證通過（match={seller_verify_taxid.get('match')}），不需重抓")
     # ✅ VLM 第3次：買方統一編號補救
     # 若買方統編不等於固定值，透過 LLM 定位裁切後再做 VLM 辨識
     if buyer_tax_id != BUYER_TAX_ID_FIXED:
@@ -2880,8 +2944,391 @@ for i, page in enumerate(pages):
             std_total_amount=std_total_amount
         )
 
+    # ============================================================
+    # ✅ VLM 第3次：明細項目補救
+    # ============================================================
+    # 若 vlm_still_failed 包含「明細項目」，
+    # 透過 LLM 定位明細區塊後裁切，再交給 VLM 辨識
+    # vlm_still_failed.append("明細項目")
+    _DETAIL_FIELD = "明細項目"
+
+    if _DETAIL_FIELD in vlm_still_failed:
+        _detail_failed_fields = [_DETAIL_FIELD]
+
+        print(
+            f"\n[VLM第3次][明細項目] "
+            f"欄位 {_detail_failed_fields} 辨識失敗，"
+            f"嘗試 LLM 定位後重新進行 VLM 辨識..."
+        )
+
+        bbox_detail = locate_field_region_by_llm(
+            ocr_text_with_position,
+            _detail_failed_fields
+        )
+
+        if (
+            bbox_detail
+            and all(k in bbox_detail for k in ["x1", "y1", "x2", "y2"])
+        ):
+            crop_bbox_detail = expand_vlm_crop_bbox_for_fields(
+                bbox_detail,
+                _detail_failed_fields,
+                page.size
+            )
+
+            cropped_detail = crop_image_region(
+                page,
+                crop_bbox_detail,
+                padding=100
+            )
+
+            os.makedirs("vlm_crop_debug", exist_ok=True)
+
+            crop_save_detail = (
+                f"vlm_crop_debug/"
+                f"page{i+1}_attempt3_明細項目_rescue.png"
+            )
+
+            cropped_detail.save(crop_save_detail)
+
+            print(
+                f"[VLM第3次][明細項目] "
+                f"裁切圖片已儲存：{crop_save_detail}，"
+                f"bbox={crop_bbox_detail}"
+            )
+
+            vlm_input_detail = cropped_detail
+
+        else:
+            print(
+                "[VLM第3次][明細項目] "
+                "LLM 定位失敗，改用整張圖"
+            )
+
+            vlm_input_detail = page
+
+        vlm_result_detail = extract_fields_from_image_region(
+            vlm_input_detail,
+            _detail_failed_fields
+        )
+
+        vlm_conf_detail = (
+            vlm_result_detail.get("__field_confidence__", {})
+            if vlm_result_detail
+            else {}
+        )
+
+        if vlm_result_detail:
+            detail_items = vlm_result_detail.get(_DETAIL_FIELD)
+
+            if isinstance(detail_items, list):
+                print(
+                    f"[VLM第3次][明細項目] "
+                    f"更新欄位 [{_DETAIL_FIELD}]: → {detail_items}"
+                )
+
+                # ------------------------------------------------
+                # 清理明細中的數量欄位
+                # 例如：
+                # 10個 → 10
+                # 2PCS → 2
+                # 1.5公斤 → 1.5
+                # ------------------------------------------------
+                for item in detail_items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    quantity_raw = str(
+                        item.get("數量") or ""
+                    ).strip()
+
+                    if not quantity_raw:
+                        continue
+
+                    quantity_match = re.match(
+                        r"[\d./]+",
+                        quantity_raw.replace(",", "")
+                    )
+
+                    if (
+                        quantity_match
+                        and quantity_match.group() != quantity_raw
+                    ):
+                        cleaned_quantity = quantity_match.group()
+
+                        print(
+                            f"[VLM第3次][明細項目] "
+                            f"數量後綴清除："
+                            f"'{quantity_raw}' → '{cleaned_quantity}'"
+                        )
+
+                        item["數量"] = cleaned_quantity
+
+                # 更新辨識結果
+                llm_fields[_DETAIL_FIELD] = detail_items
+
+                set_field_meta(
+                    _DETAIL_FIELD,
+                    detail_items,
+                    "VLM",
+                    vlm_conf_detail.get(_DETAIL_FIELD)
+                )
+
+                # ------------------------------------------------
+                # 根據明細項目的「金額」重新計算標準答案
+                # ------------------------------------------------
+                detail_total = 0
+                detail_amount_valid = True
+
+                for detail_item in detail_items:
+                    if not isinstance(detail_item, dict):
+                        detail_amount_valid = False
+                        break
+
+                    amount_raw = str(
+                        detail_item.get("金額") or ""
+                    ).replace(",", "").strip()
+
+                    if not amount_raw:
+                        detail_amount_valid = False
+                        break
+
+                    try:
+                        detail_total += int(float(amount_raw))
+
+                    except (ValueError, TypeError):
+                        detail_amount_valid = False
+                        break
+
+                if detail_amount_valid:
+                    std_sales_amount = detail_total
+
+                    if tax_type == "應稅":
+                        std_tax_amount = round(
+                            std_sales_amount * 0.05
+                        )
+                    else:
+                        std_tax_amount = 0
+
+                    std_total_amount = (
+                        std_sales_amount + std_tax_amount
+                    )
+
+                    print(
+                        "[VLM第3次][明細項目] "
+                        "重新計算標準答案："
+                        f"未稅={std_sales_amount}, "
+                        f"稅額={std_tax_amount}, "
+                        f"合計={std_total_amount}"
+                    )
+
+                else:
+                    print(
+                        "[VLM第3次][明細項目] "
+                        "明細金額不完整或格式錯誤，"
+                        "不重新計算標準答案"
+                    )
+
+                # ------------------------------------------------
+                # 重新比對
+                # ------------------------------------------------
+                compare_result = compare_with_standard(
+                    buyer_tax_id,
+                    seller_tax_id,
+                    buyer_company_name,
+                    seller_company_name,
+                    amount_validation,
+                    extracted_invoice_no,
+                    standard,
+                    llm_fields,
+                    active_rules=prefix_rule["rules"],
+                    active_detail_fields=prefix_rule["detail_fields"],
+                    tax_type=tax_type,
+                    tax_found=tax_found,
+                    std_sales_amount=std_sales_amount,
+                    std_tax_amount=std_tax_amount,
+                    std_total_amount=std_total_amount
+                )
+
+            else:
+                print(
+                    "[VLM第3次][明細項目] "
+                    "VLM 未回傳有效的明細項目 list，"
+                    "維持原結果"
+                )
+
+        else:
+            print(
+                "[VLM第3次][明細項目] "
+                "VLM 回傳空值，維持原結果"
+            )
 
 
+    # ============================================================
+    # ✅ VLM 第3次：金額欄位補救
+    # ============================================================
+    # 若 vlm_still_failed 包含：
+    # 未稅金額、稅額、合計金額、金額大寫中文
+    # 則透過 LLM 定位金額區塊後裁切，再交給 VLM 辨識
+    # vlm_still_failed.extend([
+    #     '未稅金額',
+    #     '稅額',
+    #     '合計金額',
+    #     '金額大寫中文'
+    # ])
+    _AMOUNT_FIELDS = [
+        "未稅金額",
+        "稅額",
+        "合計金額",
+        "金額大寫中文"
+    ]
+
+    _amount_failed_fields = [
+        field_name
+        for field_name in _AMOUNT_FIELDS
+        if field_name in vlm_still_failed
+    ]
+
+    if _amount_failed_fields:
+        _amount_failed_fields = _AMOUNT_FIELDS.copy()
+
+        # 裁切金額欄位時一併涵蓋明細項目表格，讓 VLM 能看到數量/單價/金額，交叉核對金額是否合理
+        # 注意：這裡只是把「明細項目」加進定位/裁切的範圍，不會要求 VLM 重新輸出明細項目本身
+        _amount_locate_fields = _amount_failed_fields + ["明細項目"]
+
+        print(
+            f"\n[VLM第3次][金額欄位] "
+            f"欄位 {_amount_failed_fields} 辨識失敗，"
+            f"嘗試 LLM 定位後重新進行 VLM 辨識..."
+        )
+
+        bbox_amount = locate_field_region_by_llm(
+            ocr_text_with_position,
+            _amount_locate_fields
+        )
+
+        if (
+            bbox_amount
+            and all(k in bbox_amount for k in ["x1", "y1", "x2", "y2"])
+        ):
+            crop_bbox_amount = expand_vlm_crop_bbox_for_fields(
+                bbox_amount,
+                _amount_failed_fields,
+                page.size
+            )
+
+            cropped_amount = crop_image_region(
+                page,
+                crop_bbox_amount,
+                padding=100
+            )
+
+            os.makedirs("vlm_crop_debug", exist_ok=True)
+
+            crop_save_amount = (
+                f"vlm_crop_debug/"
+                f"page{i+1}_attempt3_金額欄位_rescue.png"
+            )
+
+            cropped_amount.save(crop_save_amount)
+
+            print(
+                f"[VLM第3次][金額欄位] "
+                f"裁切圖片已儲存：{crop_save_amount}，"
+                f"bbox={crop_bbox_amount}"
+            )
+
+            vlm_input_amount = cropped_amount
+
+        else:
+            print(
+                "[VLM第3次][金額欄位] "
+                "LLM 定位失敗，改用整張圖"
+            )
+
+            vlm_input_amount = page
+
+        vlm_result_amount = extract_fields_from_image_region(
+            vlm_input_amount,
+            _amount_failed_fields
+        )
+
+        vlm_conf_amount = (
+            vlm_result_amount.get("__field_confidence__", {})
+            if vlm_result_amount
+            else {}
+        )
+
+        if vlm_result_amount:
+            amount_field_updated = False
+
+            for field_name in _amount_failed_fields:
+                field_value = vlm_result_amount.get(field_name)
+
+                if field_value is None:
+                    print(
+                        f"[VLM第3次][金額欄位] "
+                        f"欄位 [{field_name}] 未取得值，"
+                        f"維持原結果"
+                    )
+                    continue
+
+                # 清除數字欄位中的逗號及前後空白
+                if isinstance(field_value, str):
+                    field_value = (
+                        field_value
+                        .replace(",", "")
+                        .strip()
+                    )
+
+                print(
+                    f"[VLM第3次][金額欄位] "
+                    f"更新欄位 [{field_name}]: → {field_value}"
+                )
+
+                llm_fields[field_name] = field_value
+
+                set_field_meta(
+                    field_name,
+                    field_value,
+                    "VLM",
+                    vlm_conf_amount.get(field_name)
+                )
+
+                amount_field_updated = True
+
+            # 至少成功更新一個欄位才重新比對
+            if amount_field_updated:
+                compare_result = compare_with_standard(
+                    buyer_tax_id,
+                    seller_tax_id,
+                    buyer_company_name,
+                    seller_company_name,
+                    amount_validation,
+                    extracted_invoice_no,
+                    standard,
+                    llm_fields,
+                    active_rules=prefix_rule["rules"],
+                    active_detail_fields=prefix_rule["detail_fields"],
+                    tax_type=tax_type,
+                    tax_found=tax_found,
+                    std_sales_amount=std_sales_amount,
+                    std_tax_amount=std_tax_amount,
+                    std_total_amount=std_total_amount
+                )
+
+            else:
+                print(
+                    "[VLM第3次][金額欄位] "
+                    "沒有任何欄位成功更新，"
+                    "不重新執行比對"
+                )
+
+        else:
+            print(
+                "[VLM第3次][金額欄位] "
+                "VLM 回傳空值，維持原結果"
+            )
 
     validation_result["與Excel比對結果"] = compare_result
 

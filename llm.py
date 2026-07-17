@@ -8,10 +8,10 @@ from openai import OpenAI
 
 VLLM_LLM_MODEL = "gemma-4-26B-A4B-it"
 VLLM_LLM_MODEL_2 = "gpt-oss-120b"
-VLLM_LLM_API_BASE = "http://10.2.5.22:8190/v1"
+VLLM_LLM_API_BASE = "http://mis-4142:8190/v1"
 
 
-VLLM_API_KEY      = "sk-Wz-SOJu0vl6_0HHlVuaRXQ"
+VLLM_API_KEY      = "sk-Osbdohx-Qf6Lw0y1LTHgYA"
 
 client = OpenAI(
     api_key=VLLM_API_KEY,
@@ -253,7 +253,7 @@ def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
         "賣方統編":    """- 賣方統編（賣方統一編號）：8位數字
    - 賣方統編號碼不會是「05637971」，「05637971」是買方統編，請勿誤判
    - 請優先參考 Y 座標位置：賣方資訊通常位於發票底部、賣方章戳附近、或賣方公司名稱附近
-   - 注意：部分發票賣方統編會以「#」開頭並緊接在日期/時間戳記之後，例如「2026-05-04 16:38#23762748」，此時請擷取「#」後面的8位數字（23762748），輸出時不要包含「#」符號
+   - 注意：部分發票賣方統編會以「#」開頭並緊接在日期/時間戳記之後，例如「2026-05-04 16:38#23762748」，此時請擷取「#」後面的8位數字（23762748），請注意賣方統編號碼不會是「05637971」，「05637971」是買方統編，請不要擷取
    - 注意：部分發票賣方統編會寫在「NO.」或「No.」之後，例如「TEL:03-3509780 NO.84673493」，此時請擷取「NO.」後面的8位數字（84673493），輸出時不要包含「NO.」前綴""",
         "買方公司名稱": """- 買方公司名稱：完整公司名稱
    - 通常在「買方」或「方:」後面，可能因換行被切斷，請還原完整名稱""",
@@ -393,10 +393,25 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
             - 注意：部分發票統編寫在「NO.」之後（如「NO.84673493」），請一併納入定位範圍""",
         "買方統編":    """- 買方統一編號（8位數字）所在區域
             - 通常在「買方」或「買」字附近，可能因換行與公司名稱分開""",
-        "買方公司名稱": """- 買方公司名稱所在區域
-            - 通常在「買方」或「方:」後面，可能因換行被切斷，請還原完整名稱
-            - 買方公司名稱通常靠近「買受人」、「買方」、「統一編號」等買方欄位
-            - 買方公司名稱包含抓到標題外，後面接的文字內容也需要含括在內""",
+        "買方公司名稱": """
+            - 目標是定位「買受人／買方」標題，以及其右側實際填寫的公司名稱區域。
+            - 這個函式只需要定位區域，不需要辨識或推測公司名稱內容。
+            - 請優先尋找以下印刷標題作為定位錨點：
+            1. 「買受人」
+            2. 「買方」
+            3. 買方固定統一編號「05637971」
+            - 買方公司名稱通常位於「買受人」或「買方」文字的右側。
+            - 買方統一編號通常位於買方公司名稱的下方或左下方。
+            - 即使手寫公司名稱沒有被 OCR 辨識，也要根據「買受人」標題與買方統編的位置框選該區域。
+            - 定位範圍應包含：
+            1. 「買受人／買方」標題
+            2. 標題右側的手寫或印刷公司名稱
+            3. 必要時包含下方買方統一編號，協助後續 VLM 判斷
+            - 不要框選右側「中華民國○年○月○日」日期區域。
+            - 不要框選下方「地址」、「路街」、「段」、「巷」、「弄」、「號」區域。
+            - 不要框選更下方的品名、數量、單價、金額明細表格。
+            - 請回傳能涵蓋買方名稱的最小充分矩形，不要選擇整頁或面積最大的區域。
+            """,
         "賣方公司名稱": """- 賣方公司名稱所在區域
             - 只能從「賣方資訊區」擷取，不可從買方欄位推測或補值
             - 賣方資訊區通常位於：
@@ -404,6 +419,9 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
                 2. 「營業人蓋用統一發票專用章」附近
                 3. 賣方章戳附近
                 4. 賣方統一編號附近
+            - 即使賣方公司名稱文字沒有被 OCR 辨識到（例如整個被印章覆蓋、或印章文字辨識失敗），
+              也要根據「統一編號」、「負責人」、「TEL」、「地址」、「營業人蓋用統一發票專用章」等鄰近錨點文字，
+              框選出這些錨點所在的賣方資訊區域，不可只因為完全沒看到名稱文字就輸出 null。
             - 若同一張發票同時出現買方公司名稱與賣方公司名稱，請依 Y 座標與鄰近文字判斷：
                 - 買方公司名稱通常靠近「買受人」、「買方」、「統一編號」等買方欄位
                 - 賣方公司名稱通常靠近底部章戳、賣方統編、發票專用章
@@ -441,7 +459,15 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
     - 若 OCR 同時出現「買方統編 05637971」與其他 8 碼統編，通常 05637971 為買方；賣方請以另一組統編附近的章戳/營業人專用章區域為主。
 - ✅ 若「賣方公司名稱」辨識不完整（例如只出現「…股份有限公」），寧可以賣方統編+章戳/營業人專用章附近區域為主，不要去抓買方公司名稱來補。
 
-
+【多個候選區域處理規則】
+- 最終只能回傳一個 JSON 物件。
+- 如果判斷出兩個以上可能的 bounding box，禁止分別輸出多個 JSON。
+- 請選擇能涵蓋全部目標欄位的最大範圍。
+- 若一個候選區域只涵蓋部分目標欄位，而另一個候選區域能涵蓋全部目標欄位，必須選擇後者。
+- 若多個候選區域都能涵蓋全部目標欄位，請選擇面積最大的區域。
+- 寧可框大，不可漏掉任何目標欄位。
+- 不要輸出局部答案、備選答案、第二組座標或替代方案。
+- 不要輸出 Markdown、註解或 JSON 以外的文字。
 
 請回傳以下 JSON 格式。
 座標必須依據 OCR 文字的實際外接矩形範圍，
@@ -456,7 +482,7 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
   "reason": "<簡短說明判斷依據>"
 }}
 
-只回傳 JSON，不要加任何說明。
+只回傳一個 JSON 物件。
 
 OCR 文字如下：
 ---
@@ -558,8 +584,14 @@ OCR 文字如下：
             and failed_fields[0] == "買方公司名稱"
         )
 
+        only_seller_name = (
+            len(failed_fields) == 1
+            and failed_fields[0] == "賣方公司名稱"
+        )
+
+
         if only_buyer_tax_id:
-            margin_left = 250
+            margin_left = 0
             margin_right = 250
             margin_top = 0
             margin_bottom = 0
@@ -567,10 +599,14 @@ OCR 文字如下：
         elif only_buyer_name:
             # 買方公司名稱只向右擴展 500px
             margin_left = 0
-            margin_right = 1000
-            margin_top = 100
-            margin_bottom = 100
-
+            margin_right = 600
+            margin_top = 50
+            margin_bottom = 50
+        elif only_seller_name:
+            margin_left = 0
+            margin_right = 0
+            margin_top = 0
+            margin_bottom = 0
         else:
             margin_left = 200
             margin_right = 200
@@ -590,19 +626,17 @@ OCR 文字如下：
         result["x2"] = result.get("x2", 0) + margin_right
         result["y2"] = result.get("y2", 0) + margin_bottom
 
-        expanded_x2 = result.get("x2", 0) + margin_right
-        expanded_y2 = result.get("y2", 0) + margin_bottom
 
         result["x2"] = (
-            min(page_w_est, expanded_x2)
+            min(page_w_est, result["x2"])
             if page_w_est > 0
-            else expanded_x2
+            else result["x2"]
         )
 
         result["y2"] = (
-            min(page_h_est, expanded_y2)
+            min(page_h_est, result["y2"])
             if page_h_est > 0
-            else expanded_y2
+            else result["y2"]
         )
 
         print(
@@ -619,7 +653,6 @@ OCR 文字如下：
             f"x2={result['x2']} y2={result['y2']}"
         )
 
-        print(f"[LLM區域定位] 擴展後座標：x1={result['x1']} y1={result['y1']} x2={result['x2']} y2={result['y2']}")
         return result
 
     except Exception as e:
