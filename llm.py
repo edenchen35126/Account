@@ -6,12 +6,12 @@ from openai import OpenAI
 # LLM 設定
 # =========================
 
-VLLM_LLM_MODEL = "gemma-4-26B-A4B-it"
-VLLM_LLM_MODEL_2 = "gpt-oss-120b"
+VLLM_LLM_MODEL = "utllm-s"
+VLLM_LLM_MODEL_2 = "utllm-a"
 VLLM_LLM_API_BASE = "http://mis-4142:8190/v1"
 
 
-VLLM_API_KEY      = "sk-Osbdohx-Qf6Lw0y1LTHgYA"
+VLLM_API_KEY      = "sk-IMUDNSsGwTMxWIaraQzcyw"
 
 client = OpenAI(
     api_key=VLLM_API_KEY,
@@ -62,6 +62,40 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
         dict: 擷取結果
     """
 
+    DETAIL_FIELD_INSTRUCTION = """
+        - 明細項目：每筆包含品名、數量、單價、金額。
+
+        【輸入資料】
+        - 輸入是 OCR 文字及 [x1,y1,x2,y2] 座標。
+        - 只能根據 OCR 文字與座標判斷。
+
+        【價格列】
+        - 同一或相近 Y 座標同時出現單價、數量、金額時，視為價格列。
+        - 例如：
+        $3,500 → x5 → $17,500 → TX
+        - 對應：
+        單價=3500、數量=5、金額=17500。
+
+        【品名範圍】
+        - 品名只能取價格列之前的連續 OCR 文字。
+        - 找到價格列後，該筆品名立即結束。
+        - Y 座標大於價格列的文字，禁止再加入品名。
+        - 不可因為價格列下方文字沒有數量、單價或金額，就將它視為品名續行。
+
+        【排除內容】
+        - 排除以下標籤及其後方文字：
+        備註、備注、信注、註記、注記、說明、規格。
+        - 排除價格列下方的尺寸、材質、溫度及補充內容。
+        - 例如：
+        信注：346MMK346MM*72MM 鋁清6MM 2
+        50℃
+        上述內容全部不能加入品名。
+
+        【禁止事項】
+        - 不可將價格列之後的文字合併回品名。
+        - 不可自行補出 OCR 中不存在的文字。
+        """
+
     prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x1,y1,x2,y2]文字內容」，其中 [x1,y1,x2,y2] 是文字的外接矩形座標。
 請利用座標資訊輔助判斷版面結構：
 - Y座標相近的文字代表在同一行
@@ -81,26 +115,33 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
        07月或08月 → 07-08月
        09月或10月 → 09-10月
        11月或12月 → 11-12月
-2. 發票日期：發票上的開立日期
-   - 可能是民國格式（如「115年03月17日」）或西元格式（如「2026/03/17」或「2026-03-17」）
-   - 直接輸出原始格式，不需轉換
-   - 找不到填 null
-   - 請逐字確認格式正確，不要輸出到錯誤內容
-3. 金額大寫中文：只輸出中文大寫金額本身，不要包含「新臺幣」前綴
+2. "發票日期": - 發票日期：擷取發票上的實際開立日期。
+   - 請優先尋找「日期」、「開立日期」、「發票日期」等文字附近的日期。
+   - 請利用座標判斷：日期文字通常與「日期」或「開立日期」標籤位於相同或相近的 Y 座標，且通常位於標籤右側。
+   - 不要將「年度期間」或「發票期間」誤判為發票日期，例如「115年05-06月」不是發票日期。
+   - 不要將列印時間、交易時間、出貨日期、付款日期或章戳時間誤判為發票日期。
+   - 日期可能為以下格式：
+     1. 民國格式：115年05月07日、115/05/07、115-05-07、115.05.07
+     2. 西元格式：2026年05月07日、2026/05/07、2026-05-07、2026.05.07
+   - 若日期前方有「#」，例如「#115.05.07」，只輸出日期本身，不要輸出「#」。
+   - 若日期後面接時間，例如「2026-05-07 16:38」，只輸出日期部分「2026-05-07」。
+   - 直接保留圖片或 OCR 中的原始日期格式，不要自行轉換民國年與西元年。
+   - 找不到明確開立日期時輸出 null。,
+3. 金額大寫中文：
+- 此欄位是「OCR 原文擷取」，不是金額換算或文字修正。
+   - 必須依照 OCR 文字實際出現的字元逐字輸出。
+   - 禁止根據合計金額、未稅金額或稅額自行產生中文大寫金額。
+   - 禁止補上 OCR 中不存在的文字。
+   - 禁止將「—」、「-」、「─」、「＿」、「_」等水平線轉成「一」或「壹」。
+   - 禁止將一般數字「一、二、三」自動改成「壹、貳、參」。
+   - OCR 若為「—仟」，必須保留為「—仟」，不可輸出「壹仟」。
+   - 若 OCR 文字包含水平線、缺字或無法確認，仍應保留原文；
+     不可自行猜測正確文字。
+   - 只移除明確的「新臺幣」前綴，其他內容不可修改。
 4. 未稅金額：未含稅的銷售金額（純數字）
 5. 稅額：營業稅金額（純數字）
 6. 合計金額：含稅總計金額（純數字）
-7. 明細項目：發票中的品項明細，每筆包含品名、數量、單價、金額，輸出為 JSON 陣列
-   - ✅ 利用Y座標判斷同一列的品名、數量、單價、金額
-   - ✅ 品名可能跨多行（下一行Y座標較大，但該行沒有數量/單價/金額），請合併成完整品名
-     例如：「銅添加劑 SLOTOCOUP CU」（第一行）+ 「141」（下一行無數量單價）→ 「銅添加劑 SLOTOCOUP CU141」
-   - ✅ 料號數字可能獨立在品名上方，請將料號與品名合併
-     例如：「414288」（上一行）+ 「ENTEK PLUS HT RB1促進成膜劑」→ 「414288 ENTEK PLUS HT RB1促進成膜劑」
-   - 數量可能含單位（如 "40.0 LT"），請完整保留原始文字
-   - 單價、金額為純數字（去除逗號）
-   - 只擷取實際品項明細列，不包含合計列、稅額列
-   - 找不到的欄位填 null
-   例如：[{{"品名": "414288 ENTEK PLUS HT RB1促進成膜劑", "數量": "40.0 LT", "單價": "1470", "金額": "58800"}}]
+7. {DETAIL_FIELD_INSTRUCTION}
 
 請用以下 JSON 格式回答，找不到的欄位填 null，不要加任何多餘說明：
 {{
@@ -227,9 +268,32 @@ def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
     field_instructions = {
         "年度期間": """- 年度期間：格式為「民國年份年MM-MM月」，例如「115年03-04月」
    - 若只有開立日期，西元年 - 1911 = 民國年，月份依雙月制推算""",
-        "發票日期": """- 發票日期：發票上的開立日期（民國或西元格式，直接輸出原始格式）""",
+        "發票日期": """- 發票日期：擷取發票上的實際開立日期。
+        - 請優先尋找「日期」、「開立日期」、「發票日期」等文字附近的日期。
+        - 請利用座標判斷：日期文字通常與「日期」或「開立日期」標籤位於相同或相近的 Y 座標，且通常位於標籤右側。
+        - 不要將「年度期間」或「發票期間」誤判為發票日期，例如「115年05-06月」不是發票日期。
+        - 不要將列印時間、交易時間、出貨日期、付款日期或章戳時間誤判為發票日期。
+        - 日期可能為以下格式：
+            1. 民國格式：115年05月07日、115/05/07、115-05-07、115.05.07
+            2. 西元格式：2026年05月07日、2026/05/07、2026-05-07、2026.05.07
+        - 若日期前方有「#」，例如「#115.05.07」，只輸出日期本身，不要輸出「#」。
+        - 若日期後面接時間，例如「2026-05-07 16:38」，只輸出日期部分「2026-05-07」。
+        - 直接保留圖片或 OCR 中的原始日期格式，不要自行轉換民國年與西元年。
+        - 找不到明確開立日期時輸出 null。""",
 
-        "金額大寫中文": """- 金額大寫中文：只輸出中文大寫金額本身，不要包含「新臺幣」前綴""",
+        "金額大寫中文": """
+        - 金額大寫中文是 OCR 原文擷取，不是金額換算。
+
+        【嚴格原文規則】
+        - 只能輸出 OCR 文字中實際出現的字元。
+        - 禁止自行補字、改字或修正形近字。
+        - 禁止根據合計金額產生中文大寫金額。
+        - 禁止將「—」、「-」、「─」、「＿」、「_」轉成「一」或「壹」。
+        - 禁止將「一」自動改成「壹」。
+        - OCR 若出現「—仟」，必須保留為「—仟」。
+        - 無法確認時輸出 null，不可猜測。
+        - 只允許移除「新臺幣」前綴。
+        """,
 
         "未稅金額": """- 未稅金額：未含稅的銷售金額（純數字）""",
 
@@ -237,13 +301,84 @@ def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
 
         "合計金額": """- 合計金額：含稅總計金額（純數字）""",
 
-        "明細項目": """- 明細項目：每筆包含品名、數量、單價、金額，輸出為 JSON 陣列
-   - 利用Y座標判斷同一列的品名、數量、單價、金額
-   - 品名可能跨多行，請合併成完整品名
-   - 料號數字可能獨立在品名上方，請將料號與品名合併
-   - 數量可能含單位（如 "40.0 LT"），請完整保留
-   - 單價、金額為純數字（去除逗號）
-   - 只擷取實際品項明細列，不包含合計列、稅額列""",
+        "明細項目": """- 明細項目：每筆包含品名、數量、單價、金額，輸出為 JSON 陣列。
+
+            【輸入資料說明】
+            - 你收到的是 OCR 文字及文字座標，格式為：
+            [x1,y1,x2,y2]文字內容
+            - 你無法直接查看原始圖片，只能依 OCR 文字、X 座標、Y 座標及文字排列關係判斷。
+            - 不可自行補上 OCR 文字中沒有出現的內容。
+
+            【座標判斷規則】
+            - Y 座標相近的文字，視為位於同一列。
+            - X 座標由小到大，代表文字由左至右排列。
+            - 請先依 Y 座標將文字分成不同列，再判斷每一列的用途。
+            - 同一筆明細通常依序出現：
+            1. 品項編號或料號
+            2. 品名的一行或多行
+            3. 單價、數量、金額所在的價格列
+            4. 備註、規格或補充說明
+
+            【價格列判斷】
+            - 若同一個或相近的 Y 座標上，同時出現以下多種內容，通常代表價格列：
+            - 單價，例如「$3,500」、「3500」
+            - 數量，例如「x5」、「×5」、「5」
+            - 金額，例如「$17,500」、「17500」
+            - 稅別標記，例如「TX」
+            - 價格列通常包含至少兩個數字欄位，並依 X 座標由左至右排列。
+            - 請根據數字格式與 X 座標，分辨單價、數量及金額。
+            - 例如同一列由左至右為：
+            「$3,500」→「x5」→「$17,500」→「TX」
+            則：
+            單價 = 3500
+            數量 = 5
+            金額 = 17500
+
+            【品名開始規則】
+            - 品名通常位於價格列之前。
+            - 品項編號或料號可能獨立一行，例如「0001」。
+            - 若品項編號位於品名上方，且中間沒有其他明細的價格列，可將品項編號放在品名前方。
+            - 品名可以由價格列之前的連續多行文字組成。
+
+            【品名結束規則，優先權最高】
+            - 找到該筆明細的價格列後，品名立即結束。
+            - Y 座標大於價格列的文字，不可再合併回該筆品名。
+            - 不可因為價格列下方的某行沒有單價、數量或金額，就將其當作品名續行。
+            - 品名只能由「品項開始位置」到「價格列之前」的 OCR 文字組成。
+
+            【必須排除的內容】
+            - 以下文字禁止加入品名：
+            - 「備註：」、「備註:」
+            - 「註：」、「註:」
+            - 「說明：」、「說明:」
+            - 「規格：」、「規格:」
+            - 價格列之後的所有補充文字
+            - 尺寸、材質、溫度等位於價格列之後的內容
+            - 單價、數量、金額、TX、Tax
+            - 小計、合計、稅額、總計
+
+            【備註續行規則】
+            - 若某行以「備註」、「註」、「說明」或「規格」開頭，該行及其後方連續的補充文字均不屬於品名。
+            - 即使備註的下一行沒有再次出現「備註」字樣，也不可加入品名。
+            - 例如：
+            備註：346MM×346MM×72MM 鋁網6MM
+            50℃
+            以上兩行都不是品名。
+
+            【數值輸出規則】
+            - 數量只輸出數字，例如：
+            「x5」或「×5」輸出「5」。
+            - 單價及金額只輸出純數字，移除：
+            - 貨幣符號
+            - 逗號
+            - 空白
+            - 金額必須取價格列中代表總金額的欄位，不可把單價誤當金額。
+
+            【禁止事項】
+            - 不可將價格列之後的文字併入品名。
+            - 不可根據常識補齊 OCR 沒有辨識出的品名。
+            - 不可把備註、尺寸、材質、溫度、稅別標記加入品名。
+            - 找不到明確資料時，對應欄位輸出 null。""",
 
         # ✅ OCR+Regex 欄位
         "發票號碼":    """- 發票號碼：2個英文字母 + 8個數字，例如「BK03970041」
@@ -345,7 +480,21 @@ OCR 文字如下：
         for key in ["未稅金額", "稅額", "合計金額"]:
             if result.get(key):
                 result[key] = str(result[key]).replace(",", "").strip()
+        # ✅ 金額大寫中文：修復「字首非法字元 + 後方單位」
+        if result.get("金額大寫中文"):
+            original_amount_text = str(result["金額大寫中文"]).strip()
 
+            repaired_amount_text = repair_leading_invalid_amount_slot(
+                original_amount_text
+            )
+
+            result["金額大寫中文"] = repaired_amount_text
+
+            if repaired_amount_text != original_amount_text:
+                print(
+                    "[LLM重試] 金額大寫中文字首修正："
+                    f"{original_amount_text!r} → {repaired_amount_text!r}"
+                )
         # 明細項目清理
         items = result.get("明細項目", [])
         if isinstance(items, list):
@@ -500,12 +649,41 @@ OCR 文字如下：
         content = (response.choices[0].message.content or "").strip()
         print(f"[LLM區域定位] 回應：{content}")
 
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
-        if not json_match:
-            print("⚠️  [LLM區域定位] 找不到 JSON")
+        # 找出回應中的所有扁平 JSON 物件
+        json_candidates = re.findall(
+            r'\{[^{}]*\}',
+            content,
+            re.DOTALL
+        )
+
+        valid_results = []
+
+        for candidate in json_candidates:
+            try:
+                parsed = json.loads(candidate)
+
+                # 只接受包含完整 bbox 座標的 JSON
+                if all(
+                    key in parsed
+                    for key in ["x1", "y1", "x2", "y2"]
+                ):
+                    valid_results.append(parsed)
+
+            except json.JSONDecodeError:
+                continue
+
+        if not valid_results:
+            print("⚠️  [LLM區域定位] 找不到可解析的 bbox JSON")
             return {}
 
-        result = json.loads(json_match.group())
+        # 採用最後一個有效結果
+        # 因為模型可能先回答，再於後面輸出「修正判斷」
+        result = valid_results[-1]
+
+        print(
+            f"[LLM區域定位] 共找到 {len(valid_results)} 組有效 JSON，"
+            f"採用最後一組：{result}"
+        )
 
         # 確保都是整數
         for key in ["x1", "y1", "x2", "y2"]:
@@ -807,6 +985,87 @@ def verify_seller_name_matches_tax_id(company_name: str, tax_id: str) -> dict:
         return {"match": None, "reason": f"LLM呼叫失敗：{e}"}
 
 
+# 中文財務大寫允許使用的字元
+_FINANCIAL_AMOUNT_CHARS = set(
+    "零壹貳參肆伍陸柒捌玖拾佰仟萬億元整"
+)
+
+
+def normalize_chinese_amount_text(value: str) -> str:
+    """
+    清理中文大寫金額的格式，但不修正辨識錯字。
+    """
+    if not value:
+        return ""
+
+    text = re.sub(r"\s+", "", str(value))
+
+    # 常見格式統一
+    text = text.replace("新臺幣", "")
+    text = text.replace("新台幣", "")
+    text = text.replace("圓", "元")
+    text = text.replace("正", "整")
+
+    return text
+
+
+def get_invalid_chinese_amount_chars(value: str) -> list[str]:
+    """
+    找出不屬於中文財務大寫金額的非法字元。
+    """
+    text = normalize_chinese_amount_text(value)
+
+    invalid_chars = []
+
+    for char in text:
+        if char not in _FINANCIAL_AMOUNT_CHARS:
+            invalid_chars.append(char)
+
+    # 去除重複，保留原本出現順序
+    return list(dict.fromkeys(invalid_chars))
+
+
+# 中文大寫金額的位數單位
+_FINANCIAL_POSITION_UNITS = set("億萬仟佰拾")
+
+
+def repair_leading_invalid_amount_slot(value: str) -> str:
+    """
+    修復中文大寫金額字首的 OCR 雜訊。
+
+    規則：
+    - 只有第一個字是非法字元時才處理
+    - 第二個字必須是金額位數單位：億、萬、仟、佰、拾
+    - 將「非法字元 + 後方單位」一起移除
+    - 其他位置出現非法字元仍保留，交由後續檢核判定失敗
+
+    範例：
+    霧億零仟零佰參拾柒萬玖仟玖佰柒拾肆元整
+    → 零仟零佰參拾柒萬玖仟玖佰柒拾肆元整
+    """
+    text = normalize_chinese_amount_text(value)
+
+    if len(text) < 2:
+        return text
+
+    first_char = text[0]
+    second_char = text[1]
+
+    first_is_invalid = first_char not in _FINANCIAL_AMOUNT_CHARS
+    second_is_unit = second_char in _FINANCIAL_POSITION_UNITS
+
+    if first_is_invalid and second_is_unit:
+        repaired = text[2:]
+
+        print(
+            "[中文金額修正] 字首非法字元與單位已移除："
+            f"{text!r} → {repaired!r}"
+        )
+
+        return repaired
+
+    return text
+
 # =========================
 # ✅ 中文大寫金額轉整數（純程式碼，不依賴 LLM）
 # =========================
@@ -839,6 +1098,20 @@ def chinese_amount_to_int(s: str) -> int | None:
         '佰': 100,  '百': 100,
         '拾': 10,   '十': 10,
     }
+
+    s = normalize_chinese_amount_text(s)
+
+    # ✅ 新增：有非法字元時禁止繼續解析
+    invalid_chars = get_invalid_chinese_amount_chars(s)
+
+    if invalid_chars:
+        print(
+            "[中文金額解析] 發現非法字元："
+            f"{invalid_chars}，原始內容={s!r}"
+        )
+        return None
+
+    s = re.sub(r"元整$|元$", "", s)
 
     def parse_segment(seg: str) -> int:
         """
@@ -873,7 +1146,11 @@ def chinese_amount_to_int(s: str) -> int | None:
                 val += unit_map[ch]
                 i += 1
             else:
-                i += 1
+                # 理論上前面的合法字元檢查已經會擋住，
+                # 這裡再次保護，禁止未知字元被靜默忽略。
+                raise ValueError(
+                    f"中文大寫金額包含無法解析的字元：{ch}"
+                )
 
         return val
 
@@ -916,6 +1193,30 @@ def compare_chinese_amount_meaning_by_llm(ocr_chinese: str, total_amount) -> tup
         return False, "OCR未擷取到中文大寫金額"
     if total_amount is None:
         return False, "合計金額為空，無法比對"
+    
+    # ✅ 先正規化，再修復「字首非法字元 + 後方單位」
+    normalized_text = repair_leading_invalid_amount_slot(
+        ocr_chinese
+    )
+
+    # 後續解析與比對全部使用修復後內容
+    ocr_chinese = normalized_text
+
+    invalid_chars = get_invalid_chinese_amount_chars(
+        normalized_text
+    )
+
+    if invalid_chars:
+        print(
+            "[中文金額比對] 發現非法字元，判定失敗："
+            f"{invalid_chars}，內容={normalized_text!r}"
+        )
+
+        return (
+            False,
+            "中文大寫金額包含非法字元："
+            + "、".join(invalid_chars)
+        )
 
     # ✅ 第一步：程式碼直接轉換比對
     try:

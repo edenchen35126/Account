@@ -31,6 +31,7 @@ from llm import (
     determine_tax_type_by_llm,
     compare_chinese_amount_meaning_by_llm,
     verify_seller_name_matches_tax_id,
+    repair_leading_invalid_amount_slot,  # ✅ 新增
 )
 
 
@@ -432,13 +433,13 @@ def get_validation_rules_by_prefix(invoice_no: str, page_text_clean: str = "", p
     """根據發票號碼前兩碼英文，決定要檢核的項目"""
     if not invoice_no or len(invoice_no) < 2:
         print(f"⚠️  無法取得發票前綴，轉人工審核")
-        return {"prefix": None, "rules": None, "detail_fields": None, "unknown": True}
+        return {"prefix": None, "rules": None, "detail_fields": None, "聯式": None, "unknown": True}
 
     prefix = invoice_no[:2].upper()
 
     if prefix not in INVOICE_PREFIX_RULES:
         print(f"⚠️  發票前綴 [{prefix}] 找不到對應檢核規則，轉人工審核")
-        return {"prefix": prefix, "rules": None, "detail_fields": None, "unknown": True}
+        return {"prefix": prefix, "rules": None, "detail_fields": None, "聯式": None, "unknown": True}
 
     prefix_config = INVOICE_PREFIX_RULES[prefix]
 
@@ -462,6 +463,7 @@ def get_validation_rules_by_prefix(invoice_no: str, page_text_clean: str = "", p
         "prefix": prefix,
         "rules": selected["rules"],
         "detail_fields": _DETAIL_PRESETS.get(detail_fields_key, _DETAIL_PRESETS["FULL"]),
+        "聯式": selected.get("form_type"),
         "unknown": False
     }
     # prefix = invoice_no[:2].upper()
@@ -754,15 +756,37 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
             }
 
         if "金額大寫中文" in active_rules:
-            # --- 8. 金額大寫中文：根據合計金額與 OCR 中文大寫比對意思是否相符 ---
-            ocr_chinese = (llm_fields.get("金額大寫中文") or "").strip()
-            # 使用 LLM 判斷 OCR 中文大寫是否與合計金額數字相符
-            is_chinese_match, chinese_match_method = compare_chinese_amount_meaning_by_llm(
-                ocr_chinese, std_total_amount
+            original_chinese = (
+                llm_fields.get("金額大寫中文") or ""
+            ).strip()
+
+            # ✅ 修復字首「非法字元 + 金額單位」
+            repaired_chinese = repair_leading_invalid_amount_slot(
+                original_chinese
             )
+
+            # ✅ 關鍵：把修正結果寫回 llm_fields
+            if repaired_chinese != original_chinese:
+                llm_fields["金額大寫中文"] = repaired_chinese
+
+                print(
+                    "[中文金額回寫] 已更新 llm_fields："
+                    f"{original_chinese!r} → {repaired_chinese!r}"
+                )
+
+            # ✅ 後續一律使用修正後的內容
+            ocr_chinese = repaired_chinese
+
+            is_chinese_match, chinese_match_method = (
+                compare_chinese_amount_meaning_by_llm(
+                    ocr_chinese,
+                    std_total_amount
+                )
+            )
+
             compare["金額大寫中文"] = {
                 "標準答案": f"合計金額 {std_total_amount} 的中文大寫",
-                "OCR結果":  ocr_chinese,
+                "OCR結果": ocr_chinese,
                 "比對方式": chinese_match_method,
                 "是否一致": is_chinese_match
             }
@@ -2286,6 +2310,7 @@ for i, page in enumerate(pages):
         std_total_amount=std_total_amount
     )
 
+
     # ✅ LLM 重試（OCR+Regex 和 LLM 欄位都納入）
     MAX_FIELD_RETRY = 2
     for retry_attempt in range(MAX_FIELD_RETRY):
@@ -2430,6 +2455,7 @@ for i, page in enumerate(pages):
     _vlm2_seller_name_candidate = None  # VLM 第2次存在性檢查失敗時保留的候選値
     final_failed_fields = get_failed_fields(compare_result, ALL_RETRY_FIELDS)
     final_failed_fields = expand_failed_fields_for_amount_retry(final_failed_fields, prefix_rule["rules"])
+
     if final_failed_fields:
         # 稅別獨立重試，避免在多欄位 VLM 擷取時互相干擾
         if "營業稅稅別判斷" in final_failed_fields:
@@ -2469,7 +2495,7 @@ for i, page in enumerate(pages):
         print(f"[VLM保底] 改用 VLM 圖片理解，最多重試 {VLM_MAX_RETRY} 次...")
 
         vlm_current_fields = [f for f in final_failed_fields if f != "營業稅稅別判斷"]
-
+        # vlm_current_fields.extend(["明細項目"])
         if not vlm_current_fields:
             print("[VLM保底] 無需多欄位 VLM 補救（僅稅別欄位已處理）")
         else:
@@ -2804,8 +2830,35 @@ for i, page in enumerate(pages):
         if seller_verify_taxid.get("match") is False or seller_verify_taxid.get("match") is None:
             print(f"[VLM第3次][賣方統編] 賣方統編 '{seller_tax_id}' 與公司名稱 '{seller_company_name}' 不符（{seller_verify_taxid.get('reason')}），列為失敗項目，重新裁切辨識...")
             seller_tax_id = None
-            # 重新定位並裁切賣方統編區域
-            bbox_seller_taxid = locate_field_region_by_llm(ocr_text_with_position, ["賣方統編"])
+            def find_seller_taxid_bbox_by_regex(ocr_text_with_position: str, page_height: int, exclude_ids=None) -> dict | None:
+                """
+                直接從 OCR 文字中掃描孤立的 8 位數字，排除已知買方統編，
+                優先回傳位於頁面下半部的候選座標（賣方統編通常位於底部章戳附近）
+                """
+                exclude_ids = exclude_ids or set()
+                pattern = re.compile(r'\[(\d+),(\d+),(\d+),(\d+)\](\d{8})(?!\d)')
+                candidates = []
+                for m in pattern.finditer(ocr_text_with_position):
+                    x1, y1, x2, y2, num = m.groups()
+                    if num in exclude_ids:
+                        continue
+                    y1, y2 = int(y1), int(y2)
+                    if (y1 + y2) / 2 >= page_height * 0.5:
+                        candidates.append({"x1": int(x1), "y1": y1, "x2": int(x2), "y2": y2, "num": num})
+                if not candidates:
+                    return None
+                # 取最靠下方的候選
+                best = max(candidates, key=lambda c: c["y2"])
+                return {"x1": best["x1"], "y1": best["y1"], "x2": best["x2"], "y2": best["y2"],
+                        "reason": f"regex直接命中賣方統編候選數字 {best['num']}"}
+            bbox_seller_taxid = find_seller_taxid_bbox_by_regex(
+                ocr_text_with_position, page.size[1], exclude_ids={BUYER_TAX_ID_FIXED}
+            )
+            if not bbox_seller_taxid:
+                print("[VLM第3次][賣方統編] regex未命中，改用LLM定位")
+
+                # 重新定位並裁切賣方統編區域
+                bbox_seller_taxid = locate_field_region_by_llm(ocr_text_with_position, ["賣方統編"])
             if bbox_seller_taxid and all(k in bbox_seller_taxid for k in ["x1", "y1", "x2", "y2"]):
                 crop_bbox_seller_taxid = expand_vlm_crop_bbox_for_fields(bbox_seller_taxid, ["賣方統編"], page.size)
                 cropped_seller_taxid = crop_image_region(page, crop_bbox_seller_taxid, padding=0)
@@ -3391,6 +3444,7 @@ for i, page in enumerate(pages):
     print(f"  備註: {{'OCR結果': None, '信心值': None}}")
     multi_inv_result = detection.get("has_multiple_invoices", False)
     multi_inv_conf   = detection.get("confidence")
+    print(f"  聯式: {{'OCR結果': {repr(prefix_rule.get('聯式'))}, '信心值': '{format_confidence(field_confidence.get("發票號碼"))}', '來源': '{field_source.get("發票號碼", "未知")}'}}")
     print(f"  是否有多張發票: {{'OCR結果': {multi_inv_result}, '信心值': {repr(multi_inv_conf)}}}")
 
     print(f"\n第 {i+1} 頁 TSR cells 數量: {len(cells)}")

@@ -15,8 +15,8 @@ load_dotenv()
 # =========================
 # VLM 設定
 # =========================
-VLLM_LLM_MODEL2 = "gemma-4-26B-A4B-it"
-VLLM_LLM_MODEL3 = "gpt-oss-120b"
+VLLM_LLM_MODEL2 = "utllm-s"
+VLLM_LLM_MODEL3 = "utllm-a"
 # VLLM_LLM_API_BASE2 = "http://10.2.5.111:8015/gemma-4-26B-A4B-it/v1"
 
 VLLM_LLM_API_BASE2 = "http://mis-4142:8190/v1"
@@ -27,7 +27,7 @@ tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
 client = OpenAI(
     # api_key="sk-abc123DEF456ghi789JKL012mno345PQR678stu901VWX234yz",        # 本地部署不需要真實 key
-    api_key="sk-Osbdohx-Qf6Lw0y1LTHgYA",
+    api_key="sk-IMUDNSsGwTMxWIaraQzcyw",
     base_url=VLLM_LLM_API_BASE2
 )
 
@@ -395,8 +395,14 @@ def extract_fields_from_image_region(
     單次 VLM 辨識，回傳擷取結果
     重試邏輯由 app.py 的比對結果決定
     """
-
+    #     "發票日期": """發票上的開立日期
+    #    - 可能是民國格式（如「115年03月17日」）或西元格式（如「2026/03/17」或「2026-03-17」）
+    #    - 直接輸出原始格式，不需轉換
+    #    - 找不到填 null
+    #    - 請逐字確認格式正確，不要輸出到錯誤內容
+    #    - 其中內容需包含年,月,日
     field_instructions = {
+
         "金額大寫中文": """
             - 金額大寫中文：只輸出繁體中文財務大寫金額本身，不要包含「新臺幣」前綴。
 
