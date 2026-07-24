@@ -95,7 +95,22 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
         - 不可將價格列之後的文字合併回品名。
         - 不可自行補出 OCR 中不存在的文字。
         """
+    REMARK_FIELD_INSTRUCTION = """
+        - 備註：明細品名/數量/單價/金額以外的補充說明文字，例如 P/O 單號、批號、規格說明。
 
+        【情況A：備註是表格的獨立欄位】
+        - 若 OCR 文字中「備註」或「備注」是表格欄位標題（與「品名」「數量」「單價」「金額」同一列標題），
+          請擷取該欄位標題右側、對應每一筆明細列的文字內容。
+        - 若有多筆明細各自有備註，依明細由上到下順序，用「；」串成同一個字串輸出。
+
+        【情況B：備註是表格外的自由文字】
+        - 若「備註：」或「備註:」單獨出現在價格列/表格下方（不是表格欄位標題），
+          請擷取冒號後方的文字，直到該行結束為止。
+
+        【禁止事項】
+        - 不可自行捏造 OCR 中不存在的備註內容。
+        - 找不到任何備註文字時，輸出 null。
+        """
     prompt = f"""以下是一張發票的 OCR 辨識文字，每行格式為「[x1,y1,x2,y2]文字內容」，其中 [x1,y1,x2,y2] 是文字的外接矩形座標。
 請利用座標資訊輔助判斷版面結構：
 - Y座標相近的文字代表在同一行
@@ -142,6 +157,7 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
 5. 稅額：營業稅金額（純數字）
 6. 合計金額：含稅總計金額（純數字）
 7. {DETAIL_FIELD_INSTRUCTION}
+8. {REMARK_FIELD_INSTRUCTION}
 
 請用以下 JSON 格式回答，找不到的欄位填 null，不要加任何多餘說明：
 {{
@@ -154,6 +170,7 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
   "明細項目": [
     {{"品名": "<值或null>", "數量": "<原始文字或null>", "單價": "<純數字或null>", "金額": "<純數字或null>"}}
     ],
+  "備註": "<值或null>",
     "欄位信心值": {{
         "年度期間": "<0~1或null>",
         "發票日期": "<0~1或null>",
@@ -161,7 +178,8 @@ def extract_invoice_fields_by_llm(ocr_text: str) -> dict:
         "未稅金額": "<0~1或null>",
         "稅額": "<0~1或null>",
         "合計金額": "<0~1或null>",
-        "明細項目": "<0~1或null>"
+        "明細項目": "<0~1或null>",
+        "備註": "<0~1或null>"
     }}
 }}
 
@@ -220,7 +238,7 @@ OCR 文字如下：
 
             result["__field_confidence__"] = _normalize_field_confidence_map(
                 result.get("欄位信心值"),
-                ["年度期間", "發票日期", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目"]
+                ["年度期間", "發票日期", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目", "備註"]
             )
             result.pop("欄位信心值", None)
 
@@ -249,6 +267,7 @@ def _empty_llm_result() -> dict:
         "稅額":       None,
         "合計金額":    None,
         "明細項目":    [],
+        "備註":       None,   # ✅ 新增
         "__field_confidence__": {},
         "raw_response": None
     }
@@ -415,6 +434,22 @@ def reextract_specific_fields(ocr_text: str, failed_fields: list) -> dict:
    - 勾選框在該選項文字的右邊，不是左邊
    - 若看到「應稅  √  零稅率」，代表勾選的是「應稅」
    - 只輸出：應稅 或 零稅率 或 免稅""",
+   "備註":  """
+        - 備註：明細品名/數量/單價/金額以外的補充說明文字，例如 P/O 單號、批號、規格說明。
+
+        【情況A：備註是表格的獨立欄位】
+        - 若 OCR 文字中「備註」或「備注」是表格欄位標題（與「品名」「數量」「單價」「金額」同一列標題），
+            請擷取該欄位標題右側、對應每一筆明細列的文字內容。
+        - 若有多筆明細各自有備註，依明細由上到下順序，用「；」串成同一個字串輸出。
+
+        【情況B：備註是表格外的自由文字】
+        - 若「備註：」或「備註:」單獨出現在價格列/表格下方（不是表格欄位標題），
+            請擷取冒號後方的文字，直到該行結束為止。
+
+        【禁止事項】
+        - 不可自行捏造 OCR 中不存在的備註內容。
+        - 找不到任何備註文字時，輸出 null。
+        """, 
     }
 
     # 只針對失敗欄位
@@ -578,6 +613,8 @@ def locate_field_region_by_llm(ocr_text_with_position: str, failed_fields: list)
             - 嚴格禁止因為賣方公司名稱辨識不完整，就使用買方公司名稱補上
             - 不可根據常識、公司名稱完整度、買方名稱或上下文自行推測賣方公司名稱""",
         "營業稅稅別判斷": "營業稅稅別勾選區域（應稅/零稅率/免稅）",
+         "備註": """發票明細表格中的「備註」欄位，或明細金額下方以「備註:」開頭的說明文字所在區域"
+         -注意: 不要擅自推測位置，如果沒有「備註」相關的文字就不要輸出內容""",
     }
 
     targets = "\n".join([
@@ -767,6 +804,11 @@ OCR 文字如下：
             and failed_fields[0] == "賣方公司名稱"
         )
 
+        only_note = (
+            len(failed_fields) == 1
+            and failed_fields[0] == "備註"
+        )
+
 
         if only_buyer_tax_id:
             margin_left = 0
@@ -785,6 +827,11 @@ OCR 文字如下：
             margin_right = 0
             margin_top = 0
             margin_bottom = 0
+        elif only_note:
+            margin_left = 500
+            margin_right = 500
+            margin_top = 100
+            margin_bottom = 500
         else:
             margin_left = 200
             margin_right = 200

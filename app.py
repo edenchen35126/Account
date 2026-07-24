@@ -805,7 +805,12 @@ def compare_with_standard(buyer_tax_id, seller_tax_id, buyer_company_name, selle
             "說明":     "只要有值即通過",
             "是否一致": bool(invoice_date)
         }
-
+    if "備註" in active_rules:
+        compare["備註"] = {
+            "OCR結果":  remark_text or "未找到",
+            "說明":     "只有原文出現「備註」關鍵字時才需要有值，否則視為一致",
+            "是否一致": bool(remark_text) #(not remark_expected) or 
+        }
     # --- 整體通過判斷：所有欄位都一致才算通過 ---
     compare["全部比對通過"] = all(
         v["是否一致"] for v in compare.values() if isinstance(v, dict)
@@ -2085,9 +2090,14 @@ for i, page in enumerate(pages):
         print(f"⚠️  [格式驗證] 發票日期格式不符：'{invoice_date}'，清空並標記重辨識")
         invoice_date = None
         llm_fields["發票日期"] = None
+    # ✅ 備註：從 llm_fields 取出（LLM 已一併擷取）
+    remark_text = llm_fields.get("備註")
+    # 只有原文確實出現「備註」關鍵字，才代表這張發票理論上該有備註值
+    _REMARK_KEYWORDS = ["備註", "備注"]
+    remark_expected = any(kw in page_text_clean for kw in _REMARK_KEYWORDS)
 
     # LLM 初次擷取欄位來源與信心值
-    for llm_field in ["年度期間", "發票日期", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目"]:
+    for llm_field in ["年度期間", "發票日期", "金額大寫中文", "未稅金額", "稅額", "合計金額", "明細項目", "備註"]:
         set_field_meta(llm_field, llm_fields.get(llm_field), "LLM", llm_fields_conf_map.get(llm_field))
 
     print(f"  發票日期:    {invoice_date}")
@@ -2096,7 +2106,7 @@ for i, page in enumerate(pages):
     print(f"  未稅金額:    {llm_fields.get('未稅金額')}")
     print(f"  稅額:        {llm_fields.get('稅額')}")
     print(f"  合計金額:    {llm_fields.get('合計金額')}")
-
+    print(f"  備註:       {remark_text}")
     standard = standard_dict.get(lookup_invoice_no)
 
     # # 發票號碼找不到時，改用賣方統編從 Excel 反查
@@ -2397,6 +2407,10 @@ for i, page in enumerate(pages):
                             invoice_date = val
                             set_field_meta("發票日期", val, "LLM", retry_conf_map.get("發票日期"))
                             print(f"[LLM重試] 發票日期更新：{invoice_date}")
+                    elif field == "備註":
+                        remark_text = val
+                        set_field_meta("備註", val, "LLM", retry_conf_map.get("備註"))
+                        print(f"[LLM重試] 備註更新：{remark_text}")
                     else:
                         llm_fields[field] = val
                         set_field_meta(field, val, "LLM", retry_conf_map.get(field))
@@ -2610,6 +2624,10 @@ for i, page in enumerate(pages):
                             invoice_date = val
                             set_field_meta("發票日期", val, "VLM", vlm_conf_map.get("發票日期"))
                             print(f"[VLM保底] 發票日期更新：{invoice_date}")
+                    elif field == "備註":
+                        remark_text = val
+                        set_field_meta("備註", val, "VLM", vlm_conf_map.get("備註"))
+                        print(f"[VLM保底] 備註更新：{remark_text}")
                     else:
                         # 明細項目：存入前清理數量欄位的單位後綴（如 "40.0 YD" → "40.0"）
                         if field == "明細項目" and isinstance(val, list):
@@ -3382,36 +3400,149 @@ for i, page in enumerate(pages):
                 "[VLM第3次][金額欄位] "
                 "VLM 回傳空值，維持原結果"
             )
+    # ============================================================
+    # ✅ VLM 第3次：備註補救
+    # ============================================================
+    # 若 vlm_still_failed 包含「備註」，
+    # 透過 LLM 定位備註區塊後裁切，再交給 VLM 辨識
+    _REMARK_FIELD = "備註"
+    vlm_still_failed.append(_REMARK_FIELD)
+    if _REMARK_FIELD in vlm_still_failed:
+        _remark_failed_fields = [_REMARK_FIELD]
 
+        print(
+            f"\n[VLM第3次][備註] "
+            f"欄位 {_remark_failed_fields} 辨識失敗，"
+            f"嘗試 LLM 定位後重新進行 VLM 辨識..."
+        )
+
+        bbox_remark = locate_field_region_by_llm(
+            ocr_text_with_position,
+            _remark_failed_fields
+        )
+
+        if (
+            bbox_remark
+            and all(k in bbox_remark for k in ["x1", "y1", "x2", "y2"])
+        ):
+            crop_bbox_remark = expand_vlm_crop_bbox_for_fields(
+                bbox_remark,
+                _remark_failed_fields,
+                page.size
+            )
+
+            cropped_remark = crop_image_region(
+                page,
+                crop_bbox_remark,
+                padding=100
+            )
+
+            os.makedirs("vlm_crop_debug", exist_ok=True)
+
+            crop_save_remark = (
+                f"vlm_crop_debug/"
+                f"page{i+1}_attempt3_備註_rescue.png"
+            )
+
+
+            cropped_remark.save(crop_save_remark)
+
+            print(
+                f"[VLM第3次][備註] "
+                f"裁切圖片已儲存：{crop_save_remark}，"
+                f"bbox={crop_bbox_remark}"
+            )
+
+            vlm_input_remark = cropped_remark
+
+        else:
+            print(
+                "[VLM第3次][備註] "
+                "LLM 定位失敗，改用整張圖"
+            )
+
+            vlm_input_remark = page
+
+        vlm_result_remark = extract_fields_from_image_region(
+            vlm_input_remark,
+            _remark_failed_fields
+        )
+
+        vlm_conf_remark = (
+            vlm_result_remark.get("__field_confidence__", {})
+            if vlm_result_remark
+            else {}
+        )
+
+
+        remark_val = vlm_result_remark.get(_REMARK_FIELD)
+
+
+        remark_val = str(remark_val).strip()
+
+        print(
+            f"[VLM第3次][備註] "
+            f"更新欄位 [{_REMARK_FIELD}]: → {remark_val}"
+        )
+
+
+        remark_text = remark_val
+        llm_fields[_REMARK_FIELD] = remark_val
+
+        set_field_meta(
+            _REMARK_FIELD,
+            remark_val,
+            "VLM",
+            vlm_conf_remark.get(_REMARK_FIELD)
+        )
+
+        # 重新比對
+        compare_result = compare_with_standard(
+            buyer_tax_id,
+            seller_tax_id,
+            buyer_company_name,
+            seller_company_name,
+            amount_validation,
+            extracted_invoice_no,
+            standard,
+            llm_fields,
+            active_rules=prefix_rule["rules"],
+            active_detail_fields=prefix_rule["detail_fields"],
+            tax_type=tax_type,
+            tax_found=tax_found,
+            std_sales_amount=std_sales_amount,
+            std_tax_amount=std_tax_amount,
+            std_total_amount=std_total_amount
+        )
     validation_result["與Excel比對結果"] = compare_result
 
     # ✅ 發票日期單獨記錄（只要有值就好，不需比對標準答案）
     validation_result["發票日期"] = invoice_date or "未找到"
-
+    validation_result["備註"] = remark_text or "未找到"
     # ---------------------------------
     # 5. 顯示結果
     # ---------------------------------
-    print(f"第 {i+1} 頁擷取結果:")
-    for k, v in extracted_data.items():
-        print(f"  {k}: {v}")
+    # print(f"第 {i+1} 頁擷取結果:")
+    # for k, v in extracted_data.items():
+    #     print(f"  {k}: {v}")
 
-    print(f"\n第 {i+1} 頁檢核結果:")
-    for k, v in validation_result.items():
-        if k != "金額檢核":  # 金額檢核細節太多，不在此印出
-            print(f"  {k}: {v}")
+    # print(f"\n第 {i+1} 頁檢核結果:")
+    # for k, v in validation_result.items():
+    #     if k != "金額檢核":  # 金額檢核細節太多，不在此印出
+    #         print(f"  {k}: {v}")
 
-    print(f"\n第 {i+1} 頁 與標準答案比對:")
-    for k, v in compare_result.items():
-        if k == "明細項目" and isinstance(v, dict):
-            print(f"  明細項目 是否一致: {v.get('是否一致')}")
-            # ✅ 印出每個欄位摘要
-            for field, summary in v.get("欄位摘要", {}).items():
-                print(f"    {field}: {summary}")
-            # ✅ 印出失敗項目
-            for f in v.get("失敗項目摘要", []):
-                print(f"    ❌ 第{f['第幾筆']}筆 [{f['品名']}] 失敗欄位：{f['失敗欄位']}")
-        else:
-            print(f"  {k}: {v}")
+    # print(f"\n第 {i+1} 頁 與標準答案比對:")
+    # for k, v in compare_result.items():
+    #     if k == "明細項目" and isinstance(v, dict):
+    #         print(f"  明細項目 是否一致: {v.get('是否一致')}")
+    #         # ✅ 印出每個欄位摘要
+    #         for field, summary in v.get("欄位摘要", {}).items():
+    #             print(f"    {field}: {summary}")
+    #         # ✅ 印出失敗項目
+    #         for f in v.get("失敗項目摘要", []):
+    #             print(f"    ❌ 第{f['第幾筆']}筆 [{f['品名']}] 失敗欄位：{f['失敗欄位']}")
+    #     else:
+    #         print(f"  {k}: {v}")
 
     print(f"\n第 {i+1} 頁 輸出OCR+LLM結果摘要:")
     for k, v in compare_result.items():
@@ -3439,9 +3570,11 @@ for i, page in enumerate(pages):
                 src = field_source.get(k, "未知")
                 print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}, '信心值': '{conf}', '來源': '{src}'}}")
                 # print(f"  {k}: {{'OCR結果': {repr(v.get('結果'))}, '信心值': '{conf}'}}")
-
+    if "備註" not in compare_result:
+        # 若這個前綴群組沒把「備註」列入 active_rules，仍在此印出目前擷取值
+        print(f"  備註: {{'OCR結果': {repr(remark_text)}, '信心值': 'N/A'}}")
     print(f"  折讓單日期: {{'OCR結果': None, '信心值': None}}")
-    print(f"  備註: {{'OCR結果': None, '信心值': None}}")
+
     multi_inv_result = detection.get("has_multiple_invoices", False)
     multi_inv_conf   = detection.get("confidence")
     print(f"  聯式: {{'OCR結果': {repr(prefix_rule.get('聯式'))}, '信心值': '{format_confidence(field_confidence.get("發票號碼"))}', '來源': '{field_source.get("發票號碼", "未知")}'}}")
