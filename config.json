@@ -4,8 +4,8 @@
   "poppler_path": "Release-25.12.0-0/poppler-25.12.0/Library/bin",
   "font_path": "fonts/msjh.ttc",
   "dpi": 700,
-  "pdf_path": "file/split_output/scan-00003/丁種字軌_長條2.pdf",
-  "pdf_name": "丁種字軌_長條2",
+  "pdf_path": "file/split_output/scan-00003/page_5.pdf",
+  "pdf_name": "page_5",
   "detail_field_presets": {
     "FULL": [
       "品名",
@@ -32,7 +32,12 @@
     "BF",
     "BK",
     "BP",
-    "BA"
+    "BA",
+    "DR",
+    "DC",
+    "DB",
+    "DM",
+    "DH"
   ],
   "condition": {
     "type": "contains_any",
@@ -77,7 +82,7 @@
   },
     {
       "prefixes": [
-        "ZX"
+        "ZX","CA"
       ],
       "rules": [
         "發票號碼",

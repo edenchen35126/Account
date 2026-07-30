@@ -1844,11 +1844,30 @@ for i, page in enumerate(pages):
 
     if detection.get("has_multiple_invoices"):
         print(f"⚠️  第 {i+1} 頁偵測到多張發票，跳過辨識，請人工處理")
+
+        _multi_invoice_fields = [
+            "發票號碼", "買方統編", "買方公司名稱", "賣方統編", "賣方公司名稱",
+            "營業稅稅別判斷", "未稅金額", "稅額", "合計金額", "金額大寫中文",
+            "明細項目", "發票日期", "備註",
+        ]
+        print(f"\n第 {i+1} 頁 輸出OCR+LLM結果摘要:")
+        compare_result = {}
+        for _field in _multi_invoice_fields:
+            print(f"  {_field}: {{'OCR結果': None, '信心值': None, '來源': None}}")
+            compare_result[_field] = {"OCR結果": None, "信心值": None, "來源": None}
+        print(f"  折讓單日期: {{'OCR結果': None, '信心值': None}}")
+        compare_result["折讓單日期"] = {"OCR結果": None, "信心值": None}
+        print(f"  聯式: {{'OCR結果': None, '信心值': None, '來源': None}}")
+        compare_result["聯式"] = {"OCR結果": None, "信心值": None, "來源": None}
+        print(f"  是否有多張發票: {{'OCR結果': True, '信心值': {repr(detection.get('confidence'))}}}")
+        compare_result["是否有多張發票"] = {"OCR結果": True, "信心值": detection.get("confidence")}
+
         all_pages_result.append({
             "page":   i + 1,
-            "status": "skipped",
+            "status": "processed",
             "reason": "偵測到多張發票，請人工處理",
-            "vlm_detection": detection
+            "vlm_detection": detection,
+            "compare_result": compare_result
         })
         continue  # ✅ 跳過此頁，不進行 OCR
 
