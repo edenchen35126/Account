@@ -811,6 +811,11 @@ def extract_fields_from_image_region(
             }],
             max_tokens=2048,
             temperature=0.0
+            # extra_body={
+            #     "mm_processor_kwargs": {
+            #         "max_soft_tokens": 1120
+            #     }
+            # }
         )
 
         content = (response.choices[0].message.content or "").strip()

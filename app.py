@@ -16,6 +16,14 @@ from PIL import Image, ImageOps, ImageEnhance
 
 from qwen_vlm import extract_fields_from_image_region_qwen
 
+import requests
+import mimetypes
+
+from datetime import date
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 # ✅ 引入 VLM 判斷函式
 from vlm import (
     detect_multi_invoice, extract_fields_from_image_region, crop_image_region,
@@ -42,14 +50,14 @@ os.makedirs("jpg_pages", exist_ok=True)   # PDF 轉出的圖片存放處
 os.makedirs("output", exist_ok=True)      # 視覺化結果存放處
 os.makedirs("json_output", exist_ok=True) # JSON 結果存放處
 
-# =========================
-# OCR 初始化
-# =========================
-ocr = PaddleOCR(
-    use_doc_orientation_classify=False,  # 不做文件方向分類
-    use_doc_unwarping=False,             # 不做文件展平
-    use_textline_orientation=False       # 不做文字行方向判斷
-)
+# # =========================
+# # OCR 初始化
+# # =========================
+# ocr = PaddleOCR(
+#     use_doc_orientation_classify=False,  # 不做文件方向分類
+#     use_doc_unwarping=False,             # 不做文件展平
+#     use_textline_orientation=False       # 不做文字行方向判斷
+# )
 
 # =========================
 # 讀取設定檔
@@ -58,8 +66,8 @@ CONFIG_PATH = "config.json"
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config = json.load(f)
 
-INPUT_PATH   = config["input_path"]
-EXCEL_PATH   = config["excel_path"]
+# INPUT_PATH   = config["input_path"]
+# EXCEL_PATH   = config["excel_path"]
 POPPLER_PATH = config["poppler_path"]
 FONT_PATH    = config["font_path"]
 DPI          = config.get("dpi", 1500)
@@ -126,10 +134,101 @@ _DETAIL_PRESETS = config.get("detail_field_presets", {
     "AMOUNT": ["品名", "金額"]
 })
 
-INVOICE_PREFIX_RULES = {}
-for _group in config.get("invoice_prefix_groups", []):
-    for _prefix in _group.get("prefixes", []):
-        INVOICE_PREFIX_RULES[_prefix] = _group
+
+
+OCR_API_URL = config.get(
+    "paddleocr_api_url",
+    "http://mis-4141:8080/paddleocr/ocr"
+)
+
+OCR_API_TIMEOUT = config.get(
+    "paddleocr_api_timeout",
+    300
+)
+
+def get_period_start_month(month: int) -> int:
+    """
+    將月份轉成統一發票期別起始月份。
+
+    1、2月   -> 1
+    3、4月   -> 3
+    5、6月   -> 5
+    7、8月   -> 7
+    9、10月  -> 9
+    11、12月 -> 11
+    """
+    return ((month - 1) // 2) * 2 + 1
+
+
+def get_database_connection():
+    db_config = config["database"]
+
+    return psycopg2.connect(
+        host=db_config["host"],
+        port=db_config.get("port", 5432),
+        database=db_config["database"],
+        user=db_config["user"],
+        password=db_config["password"]
+    )
+
+
+def load_invoice_prefix_rules(
+    invoice_year: int,
+    period_month: int
+) -> dict:
+    """
+    讀取指定年度、期別的字軌與辨識規則。
+
+    回傳格式維持：
+    {
+        "VZ": {...規則...},
+        "WA": {...規則...},
+        "UV": {...規則...}
+    }
+
+    因此後面的 get_validation_rules_by_prefix()
+    幾乎不需要修改。
+    """
+
+    sql = """
+        SELECT
+            TRIM(p.prefix) AS prefix,
+            r.rule_config
+        FROM invoice_prefix_period p
+        INNER JOIN invoice_rule_profile r
+            ON r.rule_code = p.rule_code
+        WHERE p.invoice_year = %s
+          AND p.period_month = %s
+          AND r.is_active = TRUE
+    """
+
+    with get_database_connection() as conn:
+        with conn.cursor(
+            cursor_factory=RealDictCursor
+        ) as cursor:
+            cursor.execute(
+                sql,
+                (invoice_year, period_month)
+            )
+            rows = cursor.fetchall()
+
+    prefix_rules = {}
+
+    for row in rows:
+        prefix = row["prefix"].strip().upper()
+        rule_config = row["rule_config"]
+
+        prefix_rules[prefix] = rule_config
+
+    print(
+        f"[字軌資料庫] 已載入 "
+        f"{invoice_year} 年第 {period_month} 期，"
+        f"共 {len(prefix_rules)} 個字軌"
+    )
+
+    return prefix_rules
+
+INVOICE_PREFIX_RULES = {}  # 字軌規則依發票日期在各頁處理時動態載入
 
 
 def _norm_for_match(s: str) -> str:
@@ -429,19 +528,21 @@ def build_ocr_text_with_position(ocr_items: list) -> str:
 
     return "\n".join(result_lines)
 
-def get_validation_rules_by_prefix(invoice_no: str, page_text_clean: str = "", page_image=None) -> dict:
+def get_validation_rules_by_prefix(invoice_no: str, page_text_clean: str = "", page_image=None, prefix_rules: dict = None) -> dict:
     """根據發票號碼前兩碼英文，決定要檢核的項目"""
+    if prefix_rules is None:
+        prefix_rules = INVOICE_PREFIX_RULES
     if not invoice_no or len(invoice_no) < 2:
         print(f"⚠️  無法取得發票前綴，轉人工審核")
         return {"prefix": None, "rules": None, "detail_fields": None, "聯式": None, "unknown": True}
 
     prefix = invoice_no[:2].upper()
 
-    if prefix not in INVOICE_PREFIX_RULES:
+    if prefix not in prefix_rules:
         print(f"⚠️  發票前綴 [{prefix}] 找不到對應檢核規則，轉人工審核")
         return {"prefix": prefix, "rules": None, "detail_fields": None, "聯式": None, "unknown": True}
 
-    prefix_config = INVOICE_PREFIX_RULES[prefix]
+    prefix_config = prefix_rules[prefix]
 
     if "condition" in prefix_config:
         keywords = prefix_config["condition"]["keywords"]
@@ -533,60 +634,95 @@ def is_chinese_amount_match(ocr_amount: str, std_amount: str) -> tuple[bool, str
 
     return False, "不相符"
 
-# =========================
-# 讀取 Excel 標準答案
-# =========================
-def load_excel_standard(excel_path):
-    df = pd.read_excel(excel_path, dtype=str)
-    df.columns = df.columns.str.strip()
-    print(f"[DEBUG] Excel 欄位清單: {list(df.columns)}")  # ✅ 加這行確認欄位名稱
-    df = df.fillna("")
+# # =========================
+# # 讀取 Excel 標準答案
+# # =========================
+# def load_excel_standard(excel_path):
+#     df = pd.read_excel(excel_path, dtype=str)
+#     df.columns = df.columns.str.strip()
+#     print(f"[DEBUG] Excel 欄位清單: {list(df.columns)}")  # ✅ 加這行確認欄位名稱
+#     df = df.fillna("")
 
-    standard_dict = {}
-    for _, row in df.iterrows():
-        invoice_no = str(row.get("發票號碼", "")).strip()
-        if not invoice_no:
-            continue
+#     # standard_dict = {}
+#     for _, row in df.iterrows():
+#         invoice_no = str(row.get("發票號碼", "")).strip()
+#         if not invoice_no:
+#             continue
 
-        # ✅ 解析明細項目 JSON 字串
-        detail_items = []
-        raw_detail = str(row.get("明細項目", "")).strip()
+#         # ✅ 解析明細項目 JSON 字串
+#         detail_items = []
+#         raw_detail = str(row.get("明細項目", "")).strip()
 
-        print(f"[DEBUG] 發票 [{invoice_no}] 明細項目原始值: '{raw_detail}'")  # ✅ 加這行
+#         print(f"[DEBUG] 發票 [{invoice_no}] 明細項目原始值: '{raw_detail}'")  # ✅ 加這行
 
-        if raw_detail:
-            try:
-                parsed = json.loads(raw_detail)
-                if isinstance(parsed, list):
-                    # 數字欄位統一轉字串並去除逗號
-                    for item in parsed:
-                        detail_items.append({
-                            "品名": str(item.get("品名", "")).strip(),
-                            "數量": str(item.get("數量", "")).replace(",", "").strip(),
-                            "單價": str(item.get("單價", "")).replace(",", "").strip(),
-                            "金額": str(item.get("金額", "")).replace(",", "").strip(),
-                        })
-            except json.JSONDecodeError:
-                print(f"⚠️  發票 [{invoice_no}] 明細項目 JSON 解析失敗：{raw_detail}")
+#         if raw_detail:
+#             try:
+#                 parsed = json.loads(raw_detail)
+#                 if isinstance(parsed, list):
+#                     # 數字欄位統一轉字串並去除逗號
+#                     for item in parsed:
+#                         detail_items.append({
+#                             "品名": str(item.get("品名", "")).strip(),
+#                             "數量": str(item.get("數量", "")).replace(",", "").strip(),
+#                             "單價": str(item.get("單價", "")).replace(",", "").strip(),
+#                             "金額": str(item.get("金額", "")).replace(",", "").strip(),
+#                         })
+#             except json.JSONDecodeError:
+#                 print(f"⚠️  發票 [{invoice_no}] 明細項目 JSON 解析失敗：{raw_detail}")
 
-        standard_dict[invoice_no] = {
-            "發票號碼":    invoice_no,
-            "金額大寫中文": str(row.get("金額大寫中文", "")).strip(),
-            "年度期間":    str(row.get("年度期間", "")).strip(),
-            "廠商統編":    str(row.get("廠商統編", "")).strip(),
-            "廠商名稱":    str(row.get("廠商名稱", "")).strip(),
-            "未稅金額":    str(row.get("未稅金額", "")).replace(",", "").strip(),
-            "稅額":       str(row.get("稅額", "")).replace(",", "").strip(),
-            "合計金額":    str(row.get("合計金額", "")).replace(",", "").strip(),
-            "明細項目":    detail_items   # ✅ 解析後的 list
-        }
+#         standard_dict[invoice_no] = {
+#             "發票號碼":    invoice_no,
+#             "金額大寫中文": str(row.get("金額大寫中文", "")).strip(),
+#             "年度期間":    str(row.get("年度期間", "")).strip(),
+#             "廠商統編":    str(row.get("廠商統編", "")).strip(),
+#             "廠商名稱":    str(row.get("廠商名稱", "")).strip(),
+#             "未稅金額":    str(row.get("未稅金額", "")).replace(",", "").strip(),
+#             "稅額":       str(row.get("稅額", "")).replace(",", "").strip(),
+#             "合計金額":    str(row.get("合計金額", "")).replace(",", "").strip(),
+#             "明細項目":    detail_items   # ✅ 解析後的 list
+#         }
 
-    print(f"已載入標準答案，共 {len(standard_dict)} 筆")
-    return standard_dict
+#     print(f"已載入標準答案，共 {len(standard_dict)} 筆")
+#     return standard_dict
 
 # 買方統編固定值（本系統的買方永遠是此統編）
 BUYER_TAX_ID_FIXED = "05637971"
 BUYER_COMPANY_NAME_FIXED = "燿華電子股份有限公司"
+
+# =========================
+# 發票日期格式（民國 / 西元），供格式驗證與年月解析共用
+# =========================
+_DATE_PATTERNS = [
+    r'\d{2,3}年\d{1,2}月\d{1,2}日',   # 民國：115年05月04日
+    r'\d{4}-\d{1,2}-\d{1,2}',            # 西元：2026-05-04
+    r'\d{4}/\d{1,2}/\d{1,2}',            # 西元：2026/05/04
+    r'\d{2,3}/\d{1,2}/\d{1,2}',         # 民國：115/05/06
+    r'\d{2,3}-\d{1,2}-\d{1,2}',         # 民國：115-05-06
+    r'\d{4}年\d{1,2}月\d{1,2}日',       # 西元：2026年05月04日
+    r'\d{2,3}\.\d{1,2}\.\d{1,2}',       # 民國：115.05.07
+    r'\d{4}\.\d{1,2}\.\d{1,2}',         # 西元：2026.05.07
+]
+
+def parse_invoice_year_month(date_str: str):
+    """
+    從發票日期字串解析西元年份與月份。
+    民國年份（< 200）自動加 1911 換算為西元年。
+
+    Returns:
+        (year, month) tuple，或 None（解析失敗）
+    """
+    if not date_str:
+        return None
+    date_str = str(date_str).strip()
+    m = re.match(r'(\d{2,4})[年/\-\.](\d{1,2})', date_str)
+    if m:
+        year_part = int(m.group(1))
+        month = int(m.group(2))
+        if year_part < 200:   # 民國年份
+            year_part += 1911
+        return year_part, month
+    return None
+
 # =========================
 # 與 Excel 標準答案比對
 # =========================
@@ -1209,40 +1345,220 @@ def sort_bbox_texts(items, y_tolerance=10):
 
     return result
 
-# =========================
-# OCR 執行與解析
-# =========================
-def run_ocr(image_path):
-    """
-    對指定圖片執行 PaddleOCR，回傳結構化結果
+# # =========================
+# # OCR 執行與解析
+# # =========================
+# def run_ocr(image_path):
+#     """
+#     對指定圖片執行 PaddleOCR，回傳結構化結果
     
-    Returns:
-        list of dict: [{ "text": str, "poly": list, "bbox": [x1,y1,x2,y2] }, ...]
+#     Returns:
+#         list of dict: [{ "text": str, "poly": list, "bbox": [x1,y1,x2,y2] }, ...]
+#     """
+#     result = ocr.predict(image_path)
+
+#     ocr_items = []
+
+#     for res in result:
+#         data = res.json
+#         if isinstance(data, str):
+#             data = json.loads(data)
+
+#         ocr_data = data.get("res", data)
+#         texts = ocr_data.get("rec_texts", [])
+#         polys = ocr_data.get("rec_polys", ocr_data.get("dt_polys", []))
+#         scores = ocr_data.get("rec_scores", [None] * len(texts))
+
+#         for text, poly, score in zip(texts, polys, scores):
+#             bbox = poly_to_bbox(poly)
+#             ocr_items.append({
+#                 "text": cc.convert(text),
+#                 "poly": np.array(poly).astype(int).tolist(),
+#                 "bbox": bbox,
+#                 "score": float(score) if score is not None else None
+#             })
+
+#     return ocr_items
+
+
+def run_ocr(image_path: str) -> list[dict]:
     """
-    result = ocr.predict(image_path)
+    呼叫 Podman PaddleOCR API 執行 OCR。
+
+    API 回傳格式：
+    {
+        "status": "ok",
+        "filename": "...",
+        "device": "gpu:0",
+        "text_count": 123,
+        "page_text": "...",
+        "ocr_items": [
+            {
+                "text": "...",
+                "score": 0.99,
+                "poly": [[x1, y1], ...],
+                "bbox": [x1, y1, x2, y2]
+            }
+        ]
+    }
+
+    Returns:
+        list[dict]:
+        [
+            {
+                "text": str,
+                "score": float | None,
+                "poly": list,
+                "bbox": [x1, y1, x2, y2]
+            }
+        ]
+    """
+
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"OCR 輸入圖片不存在：{image_path}")
+
+    filename = os.path.basename(image_path)
+
+    # 根據副檔名取得 MIME type
+    content_type, _ = mimetypes.guess_type(image_path)
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    print(f"[PaddleOCR API] 開始辨識：{filename}")
+    print(f"[PaddleOCR API] URL：{OCR_API_URL}")
+
+    try:
+        with open(image_path, "rb") as image_file:
+            response = requests.post(
+                OCR_API_URL,
+                files={
+                    "file": (
+                        filename,
+                        image_file,
+                        content_type
+                    )
+                },
+                timeout=(10, OCR_API_TIMEOUT)
+            )
+
+        # 處理 HTTP 4xx / 5xx
+        response.raise_for_status()
+
+    except requests.exceptions.ConnectTimeout as e:
+        raise RuntimeError(
+            f"PaddleOCR API 連線逾時：{OCR_API_URL}"
+        ) from e
+
+    except requests.exceptions.ReadTimeout as e:
+        raise RuntimeError(
+            f"PaddleOCR API 推論逾時，超過 {OCR_API_TIMEOUT} 秒"
+        ) from e
+
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            f"無法連線 PaddleOCR API：{OCR_API_URL}，"
+            "請確認 Podman 容器及 API 服務是否啟動"
+        ) from e
+
+    except requests.exceptions.HTTPError as e:
+        response_text = response.text[:1000] if response is not None else ""
+        raise RuntimeError(
+            f"PaddleOCR API HTTP 錯誤："
+            f"{getattr(response, 'status_code', 'unknown')}，"
+            f"內容：{response_text}"
+        ) from e
+
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(
+            f"呼叫 PaddleOCR API 失敗：{e}"
+        ) from e
+
+    # 解析 JSON
+    try:
+        result = response.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"PaddleOCR API 回傳內容不是合法 JSON："
+            f"{response.text[:1000]}"
+        ) from e
+
+    # app(26).py 發生例外時仍可能回傳 HTTP 200，
+    # 所以不能只檢查 response.raise_for_status()
+    if result.get("status") != "ok":
+        error_message = result.get("error", "未知錯誤")
+        raise RuntimeError(
+            f"PaddleOCR API 辨識失敗：{error_message}"
+        )
+
+    raw_ocr_items = result.get("ocr_items")
+
+    if not isinstance(raw_ocr_items, list):
+        raise RuntimeError(
+            "PaddleOCR API 回傳格式錯誤：ocr_items 不是 list"
+        )
 
     ocr_items = []
 
-    for res in result:
-        data = res.json
-        if isinstance(data, str):
-            data = json.loads(data)
+    for index, item in enumerate(raw_ocr_items):
+        if not isinstance(item, dict):
+            print(
+                f"⚠️ [PaddleOCR API] 第 {index + 1} 筆 OCR 資料不是 dict，略過"
+            )
+            continue
 
-        ocr_data = data.get("res", data)
-        texts = ocr_data.get("rec_texts", [])
-        polys = ocr_data.get("rec_polys", ocr_data.get("dt_polys", []))
-        scores = ocr_data.get("rec_scores", [None] * len(texts))
+        text = str(item.get("text") or "")
 
-        for text, poly, score in zip(texts, polys, scores):
-            bbox = poly_to_bbox(poly)
-            ocr_items.append({
-                "text": cc.convert(text),
-                "poly": np.array(poly).astype(int).tolist(),
-                "bbox": bbox,
-                "score": float(score) if score is not None else None
-            })
+        # 保留 app(25).py 原本的簡體轉繁體處理
+        text = cc.convert(text)
+
+        poly = item.get("poly") or []
+        bbox = item.get("bbox")
+        score = item.get("score")
+
+        # API 若沒有 bbox，但有 poly，則在本機重新計算
+        if not bbox and poly:
+            try:
+                bbox = poly_to_bbox(poly)
+            except Exception:
+                bbox = None
+
+        if not bbox or len(bbox) != 4:
+            print(
+                f"⚠️ [PaddleOCR API] 第 {index + 1} 筆資料缺少合法 bbox，略過："
+                f"text={text!r}"
+            )
+            continue
+
+        try:
+            normalized_score = (
+                float(score)
+                if score is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            normalized_score = None
+
+        ocr_items.append({
+            "text": text,
+            "score": normalized_score,
+            "poly": poly,
+            "bbox": [
+                int(bbox[0]),
+                int(bbox[1]),
+                int(bbox[2]),
+                int(bbox[3])
+            ]
+        })
+
+    print(
+        f"[PaddleOCR API] 辨識完成："
+        f"device={result.get('device')}，"
+        f"API回傳={result.get('text_count')} 筆，"
+        f"有效資料={len(ocr_items)} 筆"
+    )
 
     return ocr_items
+
 
 def extract_value_by_keyword(text: str, keyword_pattern: str, value_pattern: str):
     """
@@ -1797,7 +2113,7 @@ def validate_amounts(table_data):
 # 載入 Excel 標準答案
 # =========================
 # EXCEL_PATH = "file/會計憑證POC.xlsx"
-standard_dict = load_excel_standard(EXCEL_PATH)
+# standard_dict = load_excel_standard(EXCEL_PATH)
 
 # =========================
 # 主流程
@@ -1990,8 +2306,77 @@ for i, page in enumerate(pages):
         print(f"⚠️  LLM/VLM 發票號碼格式不符: '{cleaned}'（應為 2 碼英文 + 8 碼數字）")
         return None
 
+    # ---------------------------------
+    # ✅ 4.4 VLM 辨識發票年月（動態載入字軌規則）
+    # ---------------------------------
+    _invoice_year_for_rules = None
+    _invoice_month_for_rules = None
+
+    print(f"\n===== 第 {i+1} 頁 發票年月辨識（字軌規則用） =====")
+
+    # Step 1: VLM 整張圖辨識
+    _date_vlm_result = extract_fields_from_image_region(page, ["發票日期"])
+    _date_vlm_str = str((_date_vlm_result or {}).get("發票日期") or "").strip()
+
+    if _date_vlm_str and any(re.fullmatch(p, _date_vlm_str) for p in _DATE_PATTERNS):
+        _parsed = parse_invoice_year_month(_date_vlm_str)
+        if _parsed:
+            _invoice_year_for_rules, _invoice_month_for_rules = _parsed
+            print(f"  [VLM] 發票日期: {_date_vlm_str} → 年: {_invoice_year_for_rules}, 月: {_invoice_month_for_rules}")
+        else:
+            print(f"⚠️  [VLM] 發票日期格式解析失敗: {_date_vlm_str!r}")
+    else:
+        print(f"⚠️  [VLM] 無法辨識有效發票日期（回傳: {_date_vlm_str!r}）")
+
+    # Step 2: LLM 定位 + VLM 裁切重辨識
+    if _invoice_year_for_rules is None:
+        print(f"⚠️  [發票年月] VLM 整張圖失敗，改用 LLM 定位後裁切重辨識...")
+        _date_bbox = locate_field_region_by_llm(ocr_text_with_position, ["發票日期"])
+        if _date_bbox and all(k in _date_bbox for k in ["x1", "y1", "x2", "y2"]):
+            _date_crop = crop_image_region(
+                page,
+                [_date_bbox["x1"], _date_bbox["y1"], _date_bbox["x2"], _date_bbox["y2"]],
+                padding=30
+            )
+            os.makedirs("vlm_crop_debug", exist_ok=True)
+            _date_crop_path = f"vlm_crop_debug/page{i+1}_invoice_date_for_rules.png"
+            _date_crop.save(_date_crop_path)
+            print(f"  [LLM+VLM] 裁切圖片已儲存：{_date_crop_path}，"
+                  f"bbox=[{_date_bbox['x1']},{_date_bbox['y1']},{_date_bbox['x2']},{_date_bbox['y2']}]")
+            _date_crop_result = extract_fields_from_image_region(_date_crop, ["發票日期"])
+            _date_crop_str = str((_date_crop_result or {}).get("發票日期") or "").strip()
+            if _date_crop_str and any(re.fullmatch(p, _date_crop_str) for p in _DATE_PATTERNS):
+                _parsed = parse_invoice_year_month(_date_crop_str)
+                if _parsed:
+                    _invoice_year_for_rules, _invoice_month_for_rules = _parsed
+                    print(f"  [LLM+VLM] 發票日期: {_date_crop_str} → 年: {_invoice_year_for_rules}, 月: {_invoice_month_for_rules}")
+                else:
+                    print(f"⚠️  [LLM+VLM] 發票日期格式解析失敗: {_date_crop_str!r}")
+            else:
+                print(f"⚠️  [LLM+VLM] 辨識結果無效（回傳: {_date_crop_str!r}）")
+        else:
+            print(f"⚠️  [發票年月] LLM 無法定位發票日期區域")
+
+    # Step 3: 仍無法辨識 → 轉人工審核
+    if _invoice_year_for_rules is None or _invoice_month_for_rules is None:
+        print(f"⚠️  第 {i+1} 頁無法辨識發票年月，轉人工審核")
+        all_pages_result.append({
+            "page":   i + 1,
+            "status": "manual_review",
+            "reason": "無法辨識發票年月，無法載入字軌規則"
+        })
+        continue
+
+    # 計算期別並動態載入本頁字軌規則
+    _invoice_period_month = get_period_start_month(_invoice_month_for_rules)
+    _page_prefix_rules = load_invoice_prefix_rules(
+        invoice_year=_invoice_year_for_rules,
+        period_month=_invoice_period_month
+    )
+    print(f"  [字軌規則] 年={_invoice_year_for_rules}, 期別月={_invoice_period_month}, 共 {len(_page_prefix_rules)} 個字軌")
+
     # ✅ 依發票前兩碼決定檢核規則
-    prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
+    prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page, prefix_rules=_page_prefix_rules)
     # # ✅ 發票前綴找不到/未設定時：先用 LLM 補抓發票號碼，再用 VLM 保底
     # if prefix_rule["prefix"] is None or prefix_rule.get("unknown"):
     #     print(f"⚠️  發票前綴無法使用，先改用 LLM 重新擷取發票號碼")
@@ -2060,7 +2445,7 @@ for i, page in enumerate(pages):
             lookup_invoice_no    = vlm_invoice_no
             extracted_data["發票號碼"] = vlm_invoice_no
             set_field_meta("發票號碼", vlm_invoice_no, "VLM", vlm_invoice_conf_map.get("發票號碼"))
-            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page)
+            prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page, prefix_rules=_page_prefix_rules)
             print(f"[前綴補救][VLM] 發票號碼更新為 {extracted_invoice_no}，前綴: [{prefix_rule['prefix']}] → 檢核項目: {prefix_rule['rules']}")
         else:
             print(f"⚠️  [前綴補救][VLM] 仍無法取得可用發票號碼")
@@ -2093,18 +2478,6 @@ for i, page in enumerate(pages):
     # ✅ 發票日期：從 llm_fields 取出（LLM 已一併擷取）
     invoice_date = llm_fields.get("發票日期")
     # 格式驗證：支援民國年份和西元日期
-    _DATE_PATTERNS = [
-        r'\d{2,3}年\d{1,2}月\d{1,2}日',   # 民國：115年05月04日
-        r'\d{4}-\d{1,2}-\d{1,2}',            # 西元：2026-05-04
-        r'\d{4}/\d{1,2}/\d{1,2}',            # 西元：2026/05/04
-
-        r'\d{2,3}/\d{1,2}/\d{1,2}',         # 民國：115/05/06
-        r'\d{2,3}-\d{1,2}-\d{1,2}',         # 民國：115-05-06
-        r'\d{4}年\d{1,2}月\d{1,2}日',       # 西元：2026年05月04日
-
-        r'\d{2,3}\.\d{1,2}\.\d{1,2}',       # 民國：115.05.07
-        r'\d{4}\.\d{1,2}\.\d{1,2}',         # 西元：2026.05.07
-    ]
     if invoice_date and not any(re.fullmatch(p, str(invoice_date).strip()) for p in _DATE_PATTERNS):
         print(f"⚠️  [格式驗證] 發票日期格式不符：'{invoice_date}'，清空並標記重辨識")
         invoice_date = None
@@ -2126,7 +2499,7 @@ for i, page in enumerate(pages):
     print(f"  稅額:        {llm_fields.get('稅額')}")
     print(f"  合計金額:    {llm_fields.get('合計金額')}")
     print(f"  備註:       {remark_text}")
-    standard = standard_dict.get(lookup_invoice_no)
+    # standard = standard_dict.get(lookup_invoice_no)
 
     # # 發票號碼找不到時，改用賣方統編從 Excel 反查
     # if standard is None and seller_tax_id:
@@ -2137,6 +2510,7 @@ for i, page in enumerate(pages):
     #             print(f"⚠️  發票號碼由 Excel 反查得到：{inv_no}（依賣方統編 {seller_tax_id} 比對）")
     #             break
 
+    standard = None  # 目前不使用 Excel 標準答案
     if standard is None:
         print(f"⚠️  找不到發票號碼 [{lookup_invoice_no}] 的標準答案")
 
