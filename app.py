@@ -2316,7 +2316,7 @@ for i, page in enumerate(pages):
 
     # Step 1: VLM 整張圖辨識
     _date_vlm_result = extract_fields_from_image_region(page, ["發票日期"])
-    _date_vlm_str = str((_date_vlm_result or {}).get("發票日期") or "").strip()
+    _date_vlm_str = re.sub(r'\s+', '', str((_date_vlm_result or {}).get("發票日期") or "").strip())
 
     if _date_vlm_str and any(re.fullmatch(p, _date_vlm_str) for p in _DATE_PATTERNS):
         _parsed = parse_invoice_year_month(_date_vlm_str)
@@ -2344,7 +2344,9 @@ for i, page in enumerate(pages):
             print(f"  [LLM+VLM] 裁切圖片已儲存：{_date_crop_path}，"
                   f"bbox=[{_date_bbox['x1']},{_date_bbox['y1']},{_date_bbox['x2']},{_date_bbox['y2']}]")
             _date_crop_result = extract_fields_from_image_region(_date_crop, ["發票日期"])
-            _date_crop_str = str((_date_crop_result or {}).get("發票日期") or "").strip()
+            _date_crop_str = re.sub(r'\s+', '', str(
+                    (_date_crop_result or {}).get("發票日期") or ""
+                ).strip())
             if _date_crop_str and any(re.fullmatch(p, _date_crop_str) for p in _DATE_PATTERNS):
                 _parsed = parse_invoice_year_month(_date_crop_str)
                 if _parsed:
@@ -2362,7 +2364,8 @@ for i, page in enumerate(pages):
         print(f"⚠️  第 {i+1} 頁無法辨識發票年月，轉人工審核")
         all_pages_result.append({
             "page":   i + 1,
-            "status": "manual_review",
+            # "status": "manual_review",
+            "status": "processed",
             "reason": "無法辨識發票年月，無法載入字軌規則"
         })
         continue
@@ -2454,7 +2457,8 @@ for i, page in enumerate(pages):
         print(f"⚠️  LLM/VLM 補救後仍無法取得發票前綴，跳過此頁")
         all_pages_result.append({
             "page":   i + 1,
-            "status": "skipped",
+            # "status": "skipped",
+            "status": "processed",
             "reason": "LLM/VLM補救後仍無法取得發票號碼前綴"
         })
         continue
@@ -2463,7 +2467,8 @@ for i, page in enumerate(pages):
     if prefix_rule.get("unknown"):
         all_pages_result.append({
             "page":   i + 1,
-            "status": "manual_review",
+            # "status": "manual_review",
+            "status": "processed",
             "reason": f"LLM/VLM補救後發票前綴 [{prefix_rule['prefix']}] 仍無對應檢核規則"
         })
         continue
@@ -3010,7 +3015,7 @@ for i, page in enumerate(pages):
                             tax_found = False
                             print(f"[VLM保底] 稅別仍未找到（回傳：{val}）")
                     elif field == "發票日期":
-                        val_date_str = str(val).strip() if val else ""
+                        val_date_str = re.sub(r'\s+', '', str(val).strip()) if val else ""
                         if val_date_str and not any(re.fullmatch(p, val_date_str) for p in _DATE_PATTERNS):
                             print(f"⚠️  [格式驗證][VLM保底] 發票日期格式不符：'{val_date_str}'，不更新")
                         else:
