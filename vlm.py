@@ -7,6 +7,7 @@ from pdf2image import convert_from_path
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 from io import BytesIO
+from json_repair import repair_json
 
 from tavily import TavilyClient
 from dotenv import load_dotenv
@@ -358,7 +359,8 @@ def verify_company_existence_by_model(company_name: str) -> dict:
             _company_existence_cache[key] = result
             return result
 
-        raw = json.loads(json_match.group())
+        # raw = json.loads(json_match.group())
+        raw = json.loads(repair_json(json_match.group()))
         exists = raw.get("exists")
 
         # 兼容模型可能回 "null"/"true"/"false" 字串
@@ -830,7 +832,8 @@ def extract_fields_from_image_region(
             print(f"⚠️  [VLM保底] 找不到 JSON")
             return {}
 
-        result = json.loads(json_match.group())
+        # result = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
 
         # 數字欄位清理
         for key in ["未稅金額", "稅額", "合計金額"]:
@@ -920,7 +923,8 @@ def extract_invoice_number_from_image(image_pil: Image.Image, known_prefix: str 
             print("⚠️  [VLM發票號碼專用] 找不到 JSON")
             return {"發票號碼": None, "reason": "VLM回應非JSON"}
 
-        result = json.loads(json_match.group())
+        # result = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
         return {
             "發票號碼": result.get("發票號碼"),
             "reason": result.get("reason", ""),
@@ -990,7 +994,8 @@ def extract_tax_type_from_image(image_pil: Image.Image) -> dict:
             print("⚠️  [VLM稅別專用] 找不到 JSON")
             return {"營業稅稅別判斷": None, "reason": "VLM回應非JSON"}
 
-        result = json.loads(json_match.group())
+        # result = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
         return {
             "營業稅稅別判斷": result.get("營業稅稅別判斷"),
             "reason": result.get("reason", ""),
@@ -1035,7 +1040,8 @@ def detect_total_ntd_text(image_pil: Image.Image) -> dict:
         if not json_match:
             return {"has_total_ntd_text": False, "matched_text": None, "reason": "VLM回應非JSON"}
 
-        result = json.loads(json_match.group())
+        # result = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
         return {
             "has_total_ntd_text": bool(result.get("has_total_ntd_text", False)),
             "matched_text": result.get("matched_text"),
@@ -1124,9 +1130,11 @@ def detect_multi_invoice(image_input, save_debug_path: str = None) -> dict:
         # 有時 VLM 會在 JSON 外面包 markdown ```json ... ```
         json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if json_match:
-            result = json.loads(json_match.group())
+            # result = json.loads(json_match.group())
+            result = json.loads(repair_json(json_match.group()))
         else:
-            result = json.loads(raw_text)
+            # result = json.loads(raw_text)
+            result = json.loads(repair_json(raw_text))
 
         # 確保 confidence 是 float
         if "confidence" in result:

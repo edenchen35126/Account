@@ -1,6 +1,7 @@
 import json
 import re
 from openai import OpenAI
+from json_repair import repair_json
 
 # =========================
 # LLM 設定
@@ -213,7 +214,8 @@ OCR 文字如下：
         try:
             json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             if json_match:
-                result = json.loads(json_match.group())
+                # result = json.loads(json_match.group())
+                result = json.loads(repair_json(json_match.group()))
             else:
                 print(f"⚠️  LLM 回應中找不到 JSON 格式，原始回應：{raw_text}")
                 result = _empty_llm_result()
@@ -509,7 +511,8 @@ OCR 文字如下：
             print(f"⚠️  [LLM重試] 找不到 JSON")
             return {}
 
-        result = json.loads(json_match.group())
+        # result = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
 
         # 數字欄位清理
         for key in ["未稅金額", "稅額", "合計金額"]:
@@ -697,7 +700,8 @@ OCR 文字如下：
 
         for candidate in json_candidates:
             try:
-                parsed = json.loads(candidate)
+                # parsed = json.loads(candidate)
+                parsed = json.loads(repair_json(candidate))
 
                 # 只接受包含完整 bbox 座標的 JSON
                 if all(
@@ -947,7 +951,8 @@ OCR 文字如下：
             print("⚠️  [LLM稅別判斷] 找不到 JSON，視為未找到勾選")
             return {"稅別": None, "已勾選": False, "判斷依據": "LLM回應解析失敗"}
 
-        result   = json.loads(json_match.group())
+        # result   = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
         tax_type = result.get("稅別")
         found    = bool(result.get("已勾選", False))
         reason   = result.get("判斷依據", "")
@@ -1012,7 +1017,8 @@ def verify_seller_name_matches_tax_id(company_name: str, tax_id: str) -> dict:
             print("⚠️  [LLM賣方驗證] 找不到 JSON，視為無法判斷")
             return {"match": None, "reason": "LLM回應解析失敗"}
 
-        result = json.loads(json_match.group())
+        # result = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
         raw_match = result.get("match")
 
         # 正規化：接受 true/false/null（JSON） 或字串 "true"/"false"
@@ -1374,7 +1380,8 @@ def compare_chinese_amount_meaning_by_llm(ocr_chinese: str, total_amount) -> tup
         if not json_match:
             return False, "LLM回應解析失敗"
 
-        result  = json.loads(json_match.group())
+        # result  = json.loads(json_match.group())
+        result = json.loads(repair_json(json_match.group()))
         matched = bool(result.get("是否相符", False))
         reason  = result.get("判斷說明", "")
         print(f"[中文金額比對] LLM 結果：{matched}（{reason}）")

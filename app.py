@@ -172,24 +172,12 @@ def get_database_connection():
     )
 
 
-def load_invoice_prefix_rules(
-    invoice_year: int,
-    period_month: int
-) -> dict:
+def load_invoice_prefix_rules(invoice_year: int) -> dict:
     """
-    讀取指定年度、期別的字軌與辨識規則。
+    從 PostgreSQL 載入指定年度的字軌規則。
 
-    回傳格式維持：
-    {
-        "VZ": {...規則...},
-        "WA": {...規則...},
-        "UV": {...規則...}
-    }
-
-    因此後面的 get_validation_rules_by_prefix()
-    幾乎不需要修改。
+    回傳格式維持 {prefix: rule_config}，讓後續辨識邏輯不需改寫。
     """
-
     sql = """
         SELECT
             TRIM(p.prefix) AS prefix,
@@ -198,34 +186,23 @@ def load_invoice_prefix_rules(
         INNER JOIN invoice_rule_profile r
             ON r.rule_code = p.rule_code
         WHERE p.invoice_year = %s
-          AND p.period_month = %s
           AND r.is_active = TRUE
     """
 
     with get_database_connection() as conn:
-        with conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
-            cursor.execute(
-                sql,
-                (invoice_year, period_month)
-            )
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(sql, (invoice_year,))
             rows = cursor.fetchall()
 
     prefix_rules = {}
-
     for row in rows:
         prefix = row["prefix"].strip().upper()
-        rule_config = row["rule_config"]
-
-        prefix_rules[prefix] = rule_config
+        prefix_rules[prefix] = row["rule_config"]
 
     print(
-        f"[字軌資料庫] 已載入 "
-        f"{invoice_year} 年第 {period_month} 期，"
+        f"[字軌資料庫] 已載入 {invoice_year} 年，"
         f"共 {len(prefix_rules)} 個字軌"
     )
-
     return prefix_rules
 
 INVOICE_PREFIX_RULES = {}  # 字軌規則依發票日期在各頁處理時動態載入
@@ -2314,19 +2291,33 @@ for i, page in enumerate(pages):
 
     print(f"\n===== 第 {i+1} 頁 發票年月辨識（字軌規則用） =====")
 
-    # Step 1: VLM 整張圖辨識
-    _date_vlm_result = extract_fields_from_image_region(page, ["發票日期"])
-    _date_vlm_str = re.sub(r'\s+', '', str((_date_vlm_result or {}).get("發票日期") or "").strip())
+    # # Step 1: VLM 整張圖辨識
+    # _date_vlm_result = extract_fields_from_image_region(page, ["發票日期"])
+    # _date_vlm_str = re.sub(r'\s+', '', str((_date_vlm_result or {}).get("發票日期") or "").strip())
 
-    if _date_vlm_str and any(re.fullmatch(p, _date_vlm_str) for p in _DATE_PATTERNS):
-        _parsed = parse_invoice_year_month(_date_vlm_str)
+    # if _date_vlm_str and any(re.fullmatch(p, _date_vlm_str) for p in _DATE_PATTERNS):
+    #     _parsed = parse_invoice_year_month(_date_vlm_str)
+    #     if _parsed:
+    #         _invoice_year_for_rules, _invoice_month_for_rules = _parsed
+    #         print(f"  [VLM] 發票日期: {_date_vlm_str} → 年: {_invoice_year_for_rules}, 月: {_invoice_month_for_rules}")
+    #     else:
+    #         print(f"⚠️  [VLM] 發票日期格式解析失敗: {_date_vlm_str!r}")
+    # else:
+    #     print(f"⚠️  [VLM] 無法辨識有效發票日期（回傳: {_date_vlm_str!r}）")
+
+    # Step 1: LLM 從 OCR 文字直接彙整發票日期
+    print(f"  [Step 1] LLM 從 OCR 文字擷取發票日期...")
+    _date_llm_result = reextract_specific_fields(ocr_text_with_position, ["發票日期"])
+    _date_llm_str = re.sub(r'\s+', '', str((_date_llm_result or {}).get("發票日期") or "").strip())
+    if _date_llm_str:
+        _parsed = parse_invoice_year_month(_date_llm_str)
         if _parsed:
             _invoice_year_for_rules, _invoice_month_for_rules = _parsed
-            print(f"  [VLM] 發票日期: {_date_vlm_str} → 年: {_invoice_year_for_rules}, 月: {_invoice_month_for_rules}")
+            print(f"  [LLM] 發票日期: {_date_llm_str} → 年: {_invoice_year_for_rules}, 月: {_invoice_month_for_rules}")
         else:
-            print(f"⚠️  [VLM] 發票日期格式解析失敗: {_date_vlm_str!r}")
+            print(f"⚠️  [LLM] 發票日期格式解析失敗: {_date_llm_str!r}")
     else:
-        print(f"⚠️  [VLM] 無法辨識有效發票日期（回傳: {_date_vlm_str!r}）")
+        print(f"⚠️  [LLM] 無法從 OCR 文字取得發票日期")
 
     # Step 2: LLM 定位 + VLM 裁切重辨識
     if _invoice_year_for_rules is None:
@@ -2347,7 +2338,7 @@ for i, page in enumerate(pages):
             _date_crop_str = re.sub(r'\s+', '', str(
                     (_date_crop_result or {}).get("發票日期") or ""
                 ).strip())
-            if _date_crop_str and any(re.fullmatch(p, _date_crop_str) for p in _DATE_PATTERNS):
+            if _date_crop_str:
                 _parsed = parse_invoice_year_month(_date_crop_str)
                 if _parsed:
                     _invoice_year_for_rules, _invoice_month_for_rules = _parsed
@@ -2360,7 +2351,8 @@ for i, page in enumerate(pages):
             print(f"⚠️  [發票年月] LLM 無法定位發票日期區域")
 
     # Step 3: 仍無法辨識 → 轉人工審核
-    if _invoice_year_for_rules is None or _invoice_month_for_rules is None:
+    # if _invoice_year_for_rules is None or _invoice_month_for_rules is None:
+    if _invoice_year_for_rules is None:
         print(f"⚠️  第 {i+1} 頁無法辨識發票年月，轉人工審核")
         all_pages_result.append({
             "page":   i + 1,
@@ -2371,13 +2363,14 @@ for i, page in enumerate(pages):
         continue
 
     # 計算期別並動態載入本頁字軌規則
-    _invoice_period_month = get_period_start_month(_invoice_month_for_rules)
+    # _invoice_period_month = get_period_start_month(_invoice_month_for_rules)
     _page_prefix_rules = load_invoice_prefix_rules(
-        invoice_year=_invoice_year_for_rules,
-        period_month=_invoice_period_month
-    )
-    print(f"  [字軌規則] 年={_invoice_year_for_rules}, 期別月={_invoice_period_month}, 共 {len(_page_prefix_rules)} 個字軌")
-
+            invoice_year=_invoice_year_for_rules,
+        )
+    print(
+            f"  [字軌規則] 年={_invoice_year_for_rules}, "
+            f"共 {len(_page_prefix_rules)} 個字軌"
+        )
     # ✅ 依發票前兩碼決定檢核規則
     prefix_rule = get_validation_rules_by_prefix(extracted_invoice_no, page_text_clean, page, prefix_rules=_page_prefix_rules)
     # # ✅ 發票前綴找不到/未設定時：先用 LLM 補抓發票號碼，再用 VLM 保底
